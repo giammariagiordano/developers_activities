@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ML Smell Activity Analyzer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .tab-active { @apply border-b-2 border-blue-500 text-blue-600 font-semibold; }
+    textarea.code { font-family: 'Courier New', monospace; font-size: 0.78rem; }
+    .badge-idle     { @apply bg-gray-100 text-gray-700; }
+    .badge-running  { @apply bg-green-100 text-green-700; }
+    .badge-paused   { @apply bg-yellow-100 text-yellow-700; }
+    .badge-completed{ @apply bg-blue-100 text-blue-700; }
+    .badge-error    { @apply bg-red-100 text-red-700; }
+    .badge-pending  { @apply bg-gray-100 text-gray-500; }
+    .badge-scanned  { @apply bg-blue-100 text-blue-600; }
+    .spinner { animation: spin 1s linear infinite; display: inline-block; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .log-entry { font-family: monospace; font-size: 0.75rem; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900 min-h-screen">
+  <div id="app"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

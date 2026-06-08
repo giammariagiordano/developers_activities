@@ -1,0 +1,9 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+aiosqlite>=0.19.0
+python-multipart>=0.0.6
+openai>=1.6.0
+httpx>=0.25.0
+gitpython>=3.1.40
+PyGithub>=2.1.1
+pandas>=2.0.0

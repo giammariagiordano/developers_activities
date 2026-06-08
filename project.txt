@@ -1,0 +1,42 @@
+PROPOSAL REVISION: Investigating Developer Activities Behind ML-Specific Code Smells (GPT-4o-mini Integration)
+1. Introduction and Framework Overview
+
+The goal of this proposal is to investigate the developers' activities when ML-specific code smells are introduced in ML-enabled systems. Given LLMs' capabilities in coding-related tasks, particularly in code understanding, and in text comprehension, our solution to overcome the two limitations (i.e., the coarse-grained granularity and the limitation of static-analysis solutions) highlighted as the research gap in the previous section is to use LLMs to infer the activities developers take during smell introduction.
+
+Specifically, we plan to develop an automated framework that integrates the ML code-smell detector CodeSmile and performs a commit-by-commit analysis, asking the LLM to identify which developer activity introduced the ML-specific code smell in the ML-enabled system. Therefore, when a new ML-specific code smell is detected, the framework automatically will identify the previous version of the smelly file (i.e., the non-smelly file, in case it exists, otherwise, it will be not considered), and will prompt the LLM by providing optimized diffs of the file versions (or only the smelly file, if the file did not exist in the previous commit), along with the commit message, summarized issue messages, and other potential relevant information of the smell-introducing commit (e.g., targeted pull request threads). It will be asked to identify what developer activity (i.e., Feature Introduction, Bug Fixing, Enhancement, and Refactoring) introduced the smell.
+
+Specifically, these four activities will be provided as input to the LLM and, based on the available information, the LLM will be asked to identify the activity that best fits the developer’s intent and, subsequently, the specific follow-up activity performed by the developer (e.g., enhancement, usability improvement, or performance improvement).
+
+To ensure the quality of the results, the framework will be evaluated using multiple prompt pattern strategies, such as few-shot prompting, role-play, and chain-of-thought, with a manual validation of the generated outputs. To guarantee high repeatability, eliminate stochastic behavior, and ensure scientific reproducibility across experiments, the framework will utilize the GPT-4o-mini API configured with a deterministic low-temperature parameter (temperature = 0). Once the most effective prompt pattern strategy is selected, the framework will automatically query the LLM multiple times (e.g., 10 times) to identify and classify developer activities, thereby reducing the risk of hallucinations. Finally, a majority-voting mechanism will be applied to determine the best-fitting category, which will be returned as the final output.
+2. Research Objective and Methodological Breakdown
+
+Research Objective [RO]. The main objective of this research is to investigate developers' activities when an ML-specific code smell is introduced into ML-enabled systems. To address this research objective, the project is structured following four Sub-Objectives (SO), described as follows:
+[SO1]: Identification of instances of ML-specific code smells.
+
+The first sub-objective is to systematically identify instances of ML-specific code smells.
+
+    Method: To address this sub-objective, ML-enabled system datasets will be evaluated based on the number of projects and historical information. Once the datasets are identified, the detection tool (CodeSmile) will be set up to perform a commit-by-commit analysis, extracting all ML-specific code smell instances.
+
+[SO2]: Analyze the changes associated with the smelly introducing commit.
+
+The second sub-objective is to identify all the developer activities that led to the introduction of the smell.
+
+    Method: To address SO2, a dedicated component already integrated into CodeSmile to detect all smelly introducing commits will be used. This component considers the file history and assigns an ID to track any path changes resulting from refactoring activities. Once these smells are identified, all changes made by developers relative to the previous commit (e.g., source code, commit messages, issue tracker, and pull requests) will be collected to provide a broader, more comprehensive view of the context and rationale for the introduced changes.
+
+    Context Window Optimization: To prevent information overload and context window saturation in the LLM, a strict data-cleaning step will be enforced during context collection. Instead of passing entire source files, only the logical code diffs directly surrounding the introduced smell will be extracted. Long issue tracker logs and pull request discussions will undergo extractive text summarization to isolate intent-related metadata and remove redundant conversational noise.
+
+[SO3]: Extract developers' activities when ML-specific code smells are introduced in ML-enabled systems.
+
+Here, we will identify the most suitable prompt pattern for extracting the developers’ activities that led to the introduction of smells in systems.
+
+    Method: To address this sub-objective, once the relevant commit pair has been identified and the optimized diff operation performed, a dedicated pre-processing phase will be applied to improve prompt quality. This phase will involve commit messages; commits whose messages contain keywords such as “merge” or similar terms will be detected via keyword matching and excluded from the prompting process. Additionally, potential issues of tangled commits will be explicitly handled by allowing the LLM to output multiple activities if deemed necessary.
+
+    Mitigating Class Imbalance Bias: To perform the classification setup, a statistically significant subset of projects will be selected to test and validate multiple prompt patterns (e.g., few-shot, roleplay, or chain-of-thought). To ensure the ground-truth validation is not biased by a disproportionate distribution of a single developer activity (e.g., a massive prevalence of Feature Introductions over Refactoring), the human baseline dataset evaluated by the intern will be strictly stratified, aiming for an evenly distributed representation of the four primary activity categories.
+
+    Execution via GPT-4o-mini API: The automated classification pipeline will be executed programmatically via the OpenAI API using the GPT-4o-mini model. This model is selected due to its advanced context comprehension capabilities, high token-processing speed, and extreme cost-efficiency, which allows for the high-volume API querying required by this project. The framework will repeat the execution a fixed number of times (e.g., 10) per commit to reduce the risk of hallucinations. A majority-voting mechanism will select the best-fitting category. In case of equal results, all tied categories will be provided in the output. The intern will manually classify the developers’ activities on the subset, and the results will then be compared with those generated by GPT-4o-mini to calculate precision and F1-score across all categories.
+
+[SO4]: Analyze and interpret empirical results.
+
+This objective focuses on interpreting the results to derive insights into the causes of ML-specific code smells.
+
+    Method: To address this sub-objective, statistical analysis will be conducted to identify potential recurrent patterns and frequencies. Specifically, the quantitative analysis will examine the cross-distribution of development actions against distinct ML smell types (e.g., Spilled Bags, Data Leakage, Long Training loops) and compute a co-occurrence matrix across smell-introducing commits. This will allow us to map specific technical debts to human behaviors (e.g., determining if specific smells are significantly more prone to appear during urgent Bug Fixing versus planned Enhancements). Finally, a detailed report will be created to summarize all the steps performed and qualitative findings.
