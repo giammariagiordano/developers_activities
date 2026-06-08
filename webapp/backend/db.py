@@ -104,6 +104,16 @@ CREATE TABLE IF NOT EXISTS vote_results (
     UNIQUE(smell_commit_id, prompt_pattern_id)
 );
 
+CREATE TABLE IF NOT EXISTS sub_activity_mapping (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    raw_sub_activity TEXT NOT NULL,
+    canonical TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, raw_sub_activity)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sam_session ON sub_activity_mapping(session_id);
 CREATE INDEX IF NOT EXISTS idx_sc_session ON smell_commits(session_id, status);
 CREATE INDEX IF NOT EXISTS idx_sc_repo ON smell_commits(repo_id);
 CREATE INDEX IF NOT EXISTS idx_lr_sc ON llm_results(smell_commit_id, prompt_pattern_id);
@@ -121,6 +131,16 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
         await db.commit()
+        # Migrations — ignore if column already exists
+        for migration in [
+            "ALTER TABLE sessions ADD COLUMN phase3_status TEXT NOT NULL DEFAULT 'idle'",
+            "ALTER TABLE smell_commits ADD COLUMN commit_date TEXT",
+        ]:
+            try:
+                await db.execute(migration)
+                await db.commit()
+            except Exception:
+                pass
 
 
 @asynccontextmanager

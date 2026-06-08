@@ -1,7 +1,7 @@
 import sys
 import os
-import tempfile
-import shutil
+import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -18,35 +18,76 @@ def _load_codesmile():
     return Inspector, FileUtils
 
 
+_DICT_PATHS = {
+    "dataframe": str(SMELL_AI_DIR / "obj_dictionaries/dataframes.csv"),
+    "model":     str(SMELL_AI_DIR / "obj_dictionaries/models.csv"),
+    "tensor":    str(SMELL_AI_DIR / "obj_dictionaries/tensors.csv"),
+}
+
+# Thread-local Inspector — created once per thread, reused across all files.
+# Inspector.inspect() is stateless (no disk writes), so this is safe.
+_thread_local = threading.local()
+
+
+def _get_thread_inspector():
+    if not hasattr(_thread_local, "inspector"):
+        Inspector, _ = _load_codesmile()
+        _thread_local.inspector = Inspector(
+            "/tmp",
+            dataframe_dict_path=_DICT_PATHS["dataframe"],
+            model_dict_path=_DICT_PATHS["model"],
+            tensor_dict_path=_DICT_PATHS["tensor"],
+        )
+    return _thread_local.inspector
+
+
+# Pre-filter: files with no ML imports cannot have ML-specific code smells.
+_ML_IMPORT_RE = re.compile(
+    r"^\s*(import|from)\s+(torch|tensorflow|tf|keras|sklearn|pandas|numpy|"
+    r"scipy|transformers|xgboost|lightgbm|catboost|cv2|PIL|gym|mlflow|"
+    r"wandb|optuna|jax|flax|mxnet|caffe|theano|lasagne|fastai)",
+    re.MULTILINE,
+)
+
+
+def _has_ml_imports(filename: str) -> bool:
+    try:
+        with open(filename, "r", errors="ignore") as f:
+            content = f.read(16384)  # 16 KB covers all imports
+        return bool(_ML_IMPORT_RE.search(content))
+    except Exception:
+        return True  # if unreadable, let CodeSmile decide
+
+
 def _inspect_file(filename: str, project_path: str) -> dict:
-    """Inspect a single .py file. Returns smell_key → smell_data. Thread-safe: own Inspector+tmpdir."""
-    Inspector, _ = _load_codesmile()
+    """Thread-safe: reuses thread-local Inspector (no CSV reload per file)."""
+    if not _has_ml_imports(filename):
+        return {}
+    inspector = _get_thread_inspector()
     results = {}
-    with tempfile.TemporaryDirectory() as tmpdir:
-        inspector = Inspector(tmpdir)
-        try:
-            df = inspector.inspect(filename)
-            if df is not None and not df.empty:
-                rel_path = os.path.relpath(filename, project_path)
-                for _, row in df.iterrows():
-                    key = (rel_path, str(row.get("function_name", "")), str(row.get("smell_name", row.get("name_smell", ""))))
-                    if key not in results:
-                        results[key] = {
-                            "file_path": rel_path,
-                            "function_name": str(row.get("function_name", "")),
-                            "smell_type": str(row.get("smell_name", row.get("name_smell", ""))),
-                            "smell_line": int(row.get("line", 0)) if row.get("line") else None,
-                            "smell_message": str(row.get("additional_info", row.get("message", ""))),
-                        }
-        except Exception:
-            pass
+    try:
+        df = inspector.inspect(filename)
+        if df is not None and not df.empty:
+            rel_path = os.path.relpath(filename, project_path)
+            for _, row in df.iterrows():
+                key = (rel_path, str(row.get("function_name", "")), str(row.get("smell_name", row.get("name_smell", ""))))
+                if key not in results:
+                    results[key] = {
+                        "file_path": rel_path,
+                        "function_name": str(row.get("function_name", "")),
+                        "smell_type": str(row.get("smell_name", row.get("name_smell", ""))),
+                        "smell_line": int(row.get("line", 0)) if row.get("line") else None,
+                        "smell_message": str(row.get("additional_info", row.get("message", ""))),
+                    }
+    except Exception:
+        pass
     return results
 
 
 def run_codesmile_on_path(project_path: str) -> dict[str, list[dict]]:
     """
     Run CodeSmile on all .py files in project_path.
-    Parallel across files (each file gets its own Inspector instance).
+    Parallel across files (thread-local Inspector per worker thread).
     """
     _, FileUtils = _load_codesmile()
     filenames = FileUtils.get_python_files(project_path)
@@ -55,7 +96,7 @@ def run_codesmile_on_path(project_path: str) -> dict[str, list[dict]]:
         return {}
 
     results = {}
-    workers = min(len(filenames), (os.cpu_count() or 4))
+    workers = min(len(filenames), max(os.cpu_count() or 4, 8))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_inspect_file, f, project_path) for f in filenames]
         for future in futures:
@@ -145,6 +186,7 @@ def scan_repo_commits(
                         "commit_hash": current_hash,
                         "prev_commit_hash": actual_prev_hash,
                         "commit_message": commit["message"],
+                        "commit_date": commit.get("date"),
                         **smell,
                     })
 

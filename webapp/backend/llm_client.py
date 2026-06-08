@@ -219,6 +219,55 @@ def _normalize_activity(value: str) -> Optional[str]:
     return None
 
 
+async def run_normalization_batch(
+    labels: list[str],
+    model: str,
+    api_key: str,
+    max_retries: int = 3,
+) -> dict[str, str]:
+    """Send a batch of raw sub_activity labels to LLM. Returns {raw: canonical}."""
+    label_list = "\n".join(f"- {l}" for l in labels)
+    prompt = f"""You are a research assistant normalizing software engineering activity labels for a scientific study.
+
+Below is a list of sub-activity labels. Assign a single canonical label to each.
+
+Labels:
+{label_list}
+
+STRICT RULES (no exceptions):
+1. Canonical labels MUST be singular (never plural): "test case" not "test cases", "memory fix" not "memory fixes"
+2. Canonical labels MUST be lowercase, 2-4 words max
+3. Be VERY aggressive in merging: if two labels describe the same concept even with different wording, they get the same canonical
+4. Merge labels that differ only in: plural/singular, capitalization, article (a/the), specific class/file names ("for ReportGenerator" vs "for Inspector" → same canonical if both mean "adding test cases")
+5. Prefer the most generic version when merging specifics: "adding test cases for ReportGenerator" → "test case addition"
+6. Output every input label exactly once
+
+Respond in valid JSON only:
+{{"mappings": [{{"raw": "<original label>", "canonical": "<normalized label>"}}, ...]}}"""
+
+    client = AsyncOpenAI(api_key=api_key)
+    for attempt in range(max_retries):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                max_tokens=4096,
+            )
+            raw = response.choices[0].message.content or ""
+            parsed = _parse_json(raw)
+            mappings = parsed.get("mappings", [])
+            return {m["raw"]: m["canonical"] for m in mappings if "raw" in m and "canonical" in m}
+        except Exception as e:
+            err = str(e).lower()
+            if ("rate_limit" in err or "429" in err) and attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt * 10)
+            elif attempt == max_retries - 1:
+                raise
+    return {}
+
+
 def compute_majority_vote(results: list[dict]) -> dict:
     valid = [r["primary_activity"] for r in results if r.get("primary_activity")]
     if not valid:

@@ -15,7 +15,7 @@ from .db import get_db, init_db, now_iso
 from .llm_client import PRESET_TEMPLATES
 from .runner import (
     is_running, pause_session, reset_session_on_startup,
-    start_phase1, start_phase2, subscribe, unsubscribe,
+    start_phase1, start_phase2, start_phase3, subscribe, unsubscribe,
 )
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
@@ -416,10 +416,40 @@ async def upload_smells(sid: int, file: UploadFile = File(...)):
 @app.get("/api/sessions/{sid}/smells")
 async def list_smells(sid: int, page: int = 1, per_page: int = 50, status: Optional[str] = None):
     offset = (page - 1) * per_page
+    base_query = """
+        SELECT sc.*,
+               r.owner || '/' || r.name as repo_name,
+               vr.primary_activity,
+               vr.tied,
+               vr.vote_count,
+               vr.total_votes,
+               (SELECT lr.sub_activity FROM llm_results lr
+                WHERE lr.smell_commit_id = sc.id
+                GROUP BY lr.sub_activity
+                ORDER BY COUNT(*) DESC LIMIT 1) as raw_sub_activity,
+               COALESCE(
+                   sam.canonical,
+                   (SELECT lr.sub_activity FROM llm_results lr
+                    WHERE lr.smell_commit_id = sc.id
+                    GROUP BY lr.sub_activity
+                    ORDER BY COUNT(*) DESC LIMIT 1)
+               ) as sub_activity
+        FROM smell_commits sc
+        JOIN repositories r ON r.id = sc.repo_id
+        LEFT JOIN vote_results vr ON vr.smell_commit_id = sc.id
+        LEFT JOIN sub_activity_mapping sam
+               ON sam.session_id = sc.session_id
+              AND sam.raw_sub_activity = (
+                   SELECT lr.sub_activity FROM llm_results lr
+                   WHERE lr.smell_commit_id = sc.id
+                   GROUP BY lr.sub_activity
+                   ORDER BY COUNT(*) DESC LIMIT 1)
+        WHERE sc.session_id=?
+    """
     async with get_db() as db:
         if status:
             rows = await (await db.execute(
-                "SELECT * FROM smell_commits WHERE session_id=? AND status=? LIMIT ? OFFSET ?",
+                base_query + " AND sc.status=? LIMIT ? OFFSET ?",
                 (sid, status, per_page, offset),
             )).fetchall()
             total = (await (await db.execute(
@@ -427,7 +457,7 @@ async def list_smells(sid: int, page: int = 1, per_page: int = 50, status: Optio
             )).fetchone())["c"]
         else:
             rows = await (await db.execute(
-                "SELECT * FROM smell_commits WHERE session_id=? LIMIT ? OFFSET ?",
+                base_query + " LIMIT ? OFFSET ?",
                 (sid, per_page, offset),
             )).fetchall()
             total = (await (await db.execute(
@@ -504,6 +534,77 @@ async def start_p2(sid: int):
         await db.commit()
     await start_phase2(sid)
     return {"status": "started", "phase": 2}
+
+
+@app.post("/api/sessions/{sid}/start-phase3")
+async def phase3(sid: int):
+    await start_phase3(sid)
+    return {"status": "started", "phase": 3}
+
+
+@app.get("/api/sessions/{sid}/phase3/mapping")
+async def get_phase3_mapping(sid: int):
+    async with get_db() as db:
+        rows = await (await db.execute(
+            "SELECT raw_sub_activity, canonical FROM sub_activity_mapping WHERE session_id=? ORDER BY canonical, raw_sub_activity",
+            (sid,),
+        )).fetchall()
+    mapping = [dict(r) for r in rows]
+    # Group by canonical
+    groups: dict[str, list[str]] = {}
+    for r in mapping:
+        groups.setdefault(r["canonical"], []).append(r["raw_sub_activity"])
+    return {"mapping": mapping, "groups": [{"canonical": k, "raws": v} for k, v in sorted(groups.items())]}
+
+
+@app.post("/api/sessions/{sid}/backfill-commit-dates")
+async def backfill_commit_dates(sid: int):
+    """Populate commit_date for existing smell_commits from local git repos."""
+    import asyncio
+    from pathlib import Path
+    from .git_client import get_commits
+
+    loop = asyncio.get_event_loop()
+
+    async with get_db() as db:
+        repos = await (await db.execute(
+            "SELECT * FROM repositories WHERE session_id=? AND local_path IS NOT NULL",
+            (sid,),
+        )).fetchall()
+
+    total_updated = 0
+    for repo in repos:
+        local_path = repo["local_path"]
+        if not local_path or not Path(local_path).exists():
+            continue
+        try:
+            commits = await loop.run_in_executor(None, get_commits, local_path, "main", None)
+        except Exception:
+            try:
+                commits = await loop.run_in_executor(None, get_commits, local_path, "HEAD", None)
+            except Exception:
+                continue
+
+        hash_to_date = {c["hash"]: c["date"] for c in commits}
+        if not hash_to_date:
+            continue
+
+        async with get_db() as db:
+            rows = await (await db.execute(
+                "SELECT id, commit_hash FROM smell_commits WHERE repo_id=? AND commit_date IS NULL",
+                (repo["id"],),
+            )).fetchall()
+            for row in rows:
+                date = hash_to_date.get(row["commit_hash"])
+                if date:
+                    await db.execute(
+                        "UPDATE smell_commits SET commit_date=? WHERE id=?",
+                        (date, row["id"]),
+                    )
+                    total_updated += 1
+            await db.commit()
+
+    return {"updated": total_updated}
 
 
 @app.post("/api/sessions/{sid}/pause")
@@ -590,6 +691,112 @@ async def results_summary(sid: int):
             "smell_status": status_counts,
             "tokens": {"input": tokens.get("inp") or 0, "output": tokens.get("out") or 0},
         }
+
+
+@app.get("/api/sessions/{sid}/results/charts")
+async def results_charts(sid: int, repo_id: Optional[int] = None):
+    """All chart data in one call. repo_id=None means all repos."""
+    async with get_db() as db:
+        scope = "AND sc.repo_id=?" if repo_id else ""
+        params_base = (sid, repo_id) if repo_id else (sid,)
+
+        # 1. Activity distribution (majority vote, first pattern)
+        act_rows = await (await db.execute(f"""
+            SELECT vr.primary_activity, COUNT(*) as cnt
+            FROM vote_results vr
+            JOIN smell_commits sc ON sc.id = vr.smell_commit_id
+            WHERE sc.session_id=? {scope}
+            GROUP BY vr.primary_activity
+        """, params_base)).fetchall()
+        activity_dist = {r["primary_activity"] or "Unknown": r["cnt"] for r in act_rows}
+
+        # 2. Smell type distribution
+        smell_rows = await (await db.execute(f"""
+            SELECT sc.smell_type, COUNT(*) as cnt
+            FROM smell_commits sc
+            WHERE sc.session_id=? {scope}
+            GROUP BY sc.smell_type ORDER BY cnt DESC
+        """, params_base)).fetchall()
+        smell_dist = [{"smell_type": r["smell_type"], "count": r["cnt"]} for r in smell_rows]
+
+        # 3. Sub-activity distribution (top 20, canonical if available)
+        sub_rows = await (await db.execute(f"""
+            SELECT COALESCE(sam.canonical,
+                (SELECT lr2.sub_activity FROM llm_results lr2
+                 WHERE lr2.smell_commit_id=sc.id
+                 GROUP BY lr2.sub_activity ORDER BY COUNT(*) DESC LIMIT 1)
+            ) as sub_act,
+            COUNT(*) as cnt
+            FROM smell_commits sc
+            LEFT JOIN sub_activity_mapping sam
+                ON sam.session_id=sc.session_id
+               AND sam.raw_sub_activity=(
+                   SELECT lr.sub_activity FROM llm_results lr
+                   WHERE lr.smell_commit_id=sc.id
+                   GROUP BY lr.sub_activity ORDER BY COUNT(*) DESC LIMIT 1)
+            WHERE sc.session_id=? {scope}
+              AND sc.status='completed'
+            GROUP BY sub_act
+            HAVING sub_act IS NOT NULL AND sub_act != ''
+            ORDER BY cnt DESC LIMIT 20
+        """, params_base)).fetchall()
+        sub_dist = [{"sub_activity": r["sub_act"], "count": r["cnt"]} for r in sub_rows]
+
+        # 4. Smell type × activity cross matrix
+        matrix_rows = await (await db.execute(f"""
+            SELECT sc.smell_type, vr.primary_activity, COUNT(*) as cnt
+            FROM vote_results vr
+            JOIN smell_commits sc ON sc.id=vr.smell_commit_id
+            WHERE sc.session_id=? {scope}
+              AND vr.primary_activity IS NOT NULL
+            GROUP BY sc.smell_type, vr.primary_activity
+        """, params_base)).fetchall()
+        cross_matrix = [{"smell_type": r["smell_type"], "activity": r["primary_activity"], "count": r["cnt"]} for r in matrix_rows]
+
+        # 5. Temporal: smell-introducing commits per month, per smell type
+        temporal_rows = await (await db.execute(f"""
+            SELECT substr(COALESCE(sc.commit_date, sc.created_at), 1, 7) as month,
+                   sc.smell_type,
+                   COUNT(*) as cnt
+            FROM smell_commits sc
+            WHERE sc.session_id=? {scope}
+            GROUP BY month, sc.smell_type
+            ORDER BY month, sc.smell_type
+        """, params_base)).fetchall()
+        temporal = [{"month": r["month"], "smell_type": r["smell_type"], "count": r["cnt"]} for r in temporal_rows]
+
+        # 6. Per-repo summary — one activity per smell_commit (first pattern)
+        repo_rows = await (await db.execute(f"""
+            SELECT r.owner, r.name,
+                   COALESCE(
+                       (SELECT vr2.primary_activity FROM vote_results vr2
+                        WHERE vr2.smell_commit_id=sc.id
+                        ORDER BY vr2.prompt_pattern_id LIMIT 1),
+                       'Unclassified'
+                   ) as activity,
+                   COUNT(*) as cnt
+            FROM smell_commits sc
+            JOIN repositories r ON r.id=sc.repo_id
+            WHERE sc.session_id=? {scope}
+            GROUP BY r.id, activity
+        """, params_base)).fetchall()
+        per_repo = [{"repo": f"{r['owner']}/{r['name']}",
+                     "activity": r["activity"], "count": r["cnt"]} for r in repo_rows]
+
+        # 7. Repos list for selector
+        repos_list = await (await db.execute(
+            "SELECT id, owner, name FROM repositories WHERE session_id=? ORDER BY owner, name", (sid,)
+        )).fetchall()
+
+    return {
+        "activity_dist": activity_dist,
+        "smell_dist": smell_dist,
+        "sub_dist": sub_dist,
+        "cross_matrix": cross_matrix,
+        "temporal": temporal,
+        "per_repo": per_repo,
+        "repos": [dict(r) for r in repos_list],
+    }
 
 
 @app.get("/api/sessions/{sid}/results/cross-matrix")
@@ -691,5 +898,6 @@ async def root():
 async def static(path: str):
     fp = FRONTEND_DIR / path
     if fp.exists() and fp.is_file():
-        return FileResponse(fp)
+        headers = {"Cache-Control": "no-store"} if fp.suffix in (".js", ".css") else {}
+        return FileResponse(fp, headers=headers)
     return FileResponse(FRONTEND_DIR / "index.html")

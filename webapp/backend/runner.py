@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from .db import get_db, now_iso
 from .git_client import clone_or_update, get_commits, get_file_diff, extract_diff_around_line
 from .codesmile_runner import scan_repo_commits
-from .llm_client import run_llm_query, build_prompt, compute_majority_vote
+from .llm_client import run_llm_query, build_prompt, compute_majority_vote, run_normalization_batch
 
 # Global: active asyncio tasks per session
 _active: dict[int, asyncio.Task] = {}
@@ -70,6 +70,140 @@ async def start_phase2(session_id: int):
     _active[session_id] = t
 
 
+async def start_phase3(session_id: int):
+    if is_running(session_id):
+        return
+    t = asyncio.create_task(_run_phase3(session_id))
+    _active[session_id] = t
+
+
+async def _run_phase3(session_id: int):
+    try:
+        async with get_db() as db:
+            sess = dict(await (await db.execute(
+                "SELECT * FROM sessions WHERE id=?", (session_id,)
+            )).fetchone())
+            await db.execute(
+                "UPDATE sessions SET status='running', phase3_status='running', updated_at=? WHERE id=?",
+                (now_iso(), session_id),
+            )
+            await db.commit()
+
+        await _broadcast(session_id, "status", {"status": "running", "phase": 3})
+
+        # Collect all unique sub_activities for this session from llm_results
+        async with get_db() as db:
+            rows = await (await db.execute("""
+                SELECT DISTINCT lr.sub_activity
+                FROM llm_results lr
+                JOIN smell_commits sc ON sc.id = lr.smell_commit_id
+                WHERE sc.session_id = ?
+                  AND lr.sub_activity IS NOT NULL
+                  AND trim(lr.sub_activity) != ''
+            """, (session_id,))).fetchall()
+
+        all_labels = [r["sub_activity"] for r in rows]
+
+        if not all_labels:
+            async with get_db() as db:
+                await db.execute(
+                    "UPDATE sessions SET status='idle', phase3_status='completed', updated_at=? WHERE id=?",
+                    (now_iso(), session_id),
+                )
+                await db.commit()
+            await _broadcast(session_id, "phase3_complete", {"mapped": 0})
+            return
+
+        # Pre-dedup: lowercase+strip+basic singularization before sending to LLM
+        def _pre_singularize(s: str) -> str:
+            s = s.lower().strip()
+            # simple English plural → singular for common endings
+            if s.endswith("ies") and len(s) > 4:
+                s = s[:-3] + "y"
+            elif s.endswith("ses") and len(s) > 4:
+                s = s[:-2]
+            elif s.endswith("xes") and len(s) > 4:
+                s = s[:-2]
+            elif s.endswith("ches") and len(s) > 5:
+                s = s[:-2]
+            elif s.endswith("shes") and len(s) > 5:
+                s = s[:-2]
+            elif s.endswith("ves") and len(s) > 4:
+                s = s[:-3] + "f"
+            elif s.endswith("s") and not s.endswith("ss") and len(s) > 3:
+                s = s[:-1]
+            return s
+
+        pre_norm: dict[str, str] = {l: _pre_singularize(l) for l in all_labels}
+        unique_for_llm = list(dict.fromkeys(pre_norm.values()))  # preserve order, dedup
+
+        await _broadcast(session_id, "phase3_progress", {"total": len(unique_for_llm), "done": 0})
+
+        # Pass 1: normalize unique lowercased labels → intermediate canonicals
+        BATCH_SIZE = 50
+        pass1: dict[str, str] = {}
+        for i in range(0, len(unique_for_llm), BATCH_SIZE):
+            batch = unique_for_llm[i: i + BATCH_SIZE]
+            mappings = await run_normalization_batch(batch, sess["model"], sess["openai_api_key"])
+            pass1.update(mappings)
+            await _broadcast(session_id, "phase3_progress", {
+                "total": len(unique_for_llm),
+                "done": min(i + BATCH_SIZE, len(unique_for_llm)),
+                "pass": 1,
+            })
+
+        # Pass 2: normalize the intermediate canonicals themselves
+        # (merges near-duplicates like "test case" / "test cases")
+        intermediate_canonicals = list(set(pass1.values()))
+        pass2: dict[str, str] = {}
+        for i in range(0, len(intermediate_canonicals), BATCH_SIZE):
+            batch = intermediate_canonicals[i: i + BATCH_SIZE]
+            mappings = await run_normalization_batch(batch, sess["model"], sess["openai_api_key"])
+            pass2.update(mappings)
+            await _broadcast(session_id, "phase3_progress", {
+                "total": len(intermediate_canonicals),
+                "done": min(i + BATCH_SIZE, len(intermediate_canonicals)),
+                "pass": 2,
+            })
+
+        # Compose: original_raw → lowercased → pass1 → pass2 → final canonical
+        # pre_norm maps original_raw → lowercased
+        # pass1 maps lowercased → intermediate canonical
+        # pass2 maps intermediate → final canonical
+        all_mappings: dict[str, str] = {}
+        for original_raw, lowercased in pre_norm.items():
+            intermediate = pass1.get(lowercased, lowercased)
+            final = pass2.get(intermediate, intermediate)
+            all_mappings[original_raw] = final
+
+        # Persist mapping
+        now = now_iso()
+        async with get_db() as db:
+            for raw, canonical in all_mappings.items():
+                await db.execute(
+                    """INSERT OR REPLACE INTO sub_activity_mapping
+                       (session_id, raw_sub_activity, canonical, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (session_id, raw, canonical, now),
+                )
+            await db.execute(
+                "UPDATE sessions SET status='idle', phase3_status='completed', updated_at=? WHERE id=?",
+                (now, session_id),
+            )
+            await db.commit()
+
+        await _broadcast(session_id, "phase3_complete", {"mapped": len(all_mappings)})
+
+    except Exception as e:
+        async with get_db() as db:
+            await db.execute(
+                "UPDATE sessions SET status='error', phase3_status='error', updated_at=? WHERE id=?",
+                (now_iso(), session_id),
+            )
+            await db.commit()
+        await _broadcast(session_id, "error", {"message": str(e)})
+
+
 async def pause_session(session_id: int):
     async with get_db() as db:
         await db.execute(
@@ -84,6 +218,19 @@ async def reset_session_on_startup():
     async with get_db() as db:
         await db.execute(
             "UPDATE sessions SET status='paused', updated_at=? WHERE status IN ('running','pausing')",
+            (now_iso(),),
+        )
+        # Align phase statuses with session status
+        await db.execute(
+            "UPDATE sessions SET phase1_status='paused', updated_at=? WHERE status='paused' AND phase1_status='running'",
+            (now_iso(),),
+        )
+        await db.execute(
+            "UPDATE sessions SET phase2_status='paused', updated_at=? WHERE status='paused' AND phase2_status='running'",
+            (now_iso(),),
+        )
+        await db.execute(
+            "UPDATE sessions SET phase3_status='paused', updated_at=? WHERE status='paused' AND phase3_status='running'",
             (now_iso(),),
         )
         await db.execute(
@@ -249,10 +396,25 @@ async def _scan_repo(session_id: int, repo: dict, sess: dict):
         })
 
         # Scan commits in a thread (blocking operation)
+        # progress_cb runs inside ThreadPoolExecutor — use raw sqlite3 for DB writes
+        import sqlite3 as _sqlite3
+        _db_path_str = str(__import__('pathlib').Path(__file__).parent.parent / "data" / "analysis.db")
+        total_commits = len(commits)
         scanned_index = [start_idx]
 
         def progress_cb(idx, skip=False, error=None):
             scanned_index[0] = idx
+            if idx % 5 == 0 or idx == total_commits - 1:
+                try:
+                    conn = _sqlite3.connect(_db_path_str, timeout=5)
+                    conn.execute(
+                        "UPDATE repositories SET current_commit_index=?, updated_at=? WHERE id=?",
+                        (idx, now_iso(), repo_id),
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
 
         smell_instances = await loop.run_in_executor(
             _executor, scan_repo_commits, local_path, commits, start_idx, progress_cb
@@ -266,12 +428,12 @@ async def _scan_repo(session_id: int, repo: dict, sess: dict):
                     """INSERT INTO smell_commits
                        (session_id, repo_id, commit_hash, prev_commit_hash, file_path,
                         function_name, smell_type, smell_line, smell_message,
-                        commit_message, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        commit_message, commit_date, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (session_id, repo_id, s["commit_hash"], s.get("prev_commit_hash"),
                      s["file_path"], s.get("function_name"), s["smell_type"],
                      s.get("smell_line"), s.get("smell_message"),
-                     s.get("commit_message"), now, now),
+                     s.get("commit_message"), s.get("commit_date"), now, now),
                 )
 
             phase1_done_inc = len(smell_instances)
@@ -516,15 +678,27 @@ async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore):
                     )
                     await db.commit()
 
+        # Only mark completed if at least one LLM result was stored
         async with get_db() as db:
-            await db.execute(
-                "UPDATE smell_commits SET status='completed', updated_at=? WHERE id=?",
-                (now_iso(), sc_id),
-            )
-            await db.execute(
-                "UPDATE sessions SET phase2_done=phase2_done+1, updated_at=? WHERE id=?",
-                (now_iso(), session_id),
-            )
+            has_results = (await (await db.execute(
+                "SELECT COUNT(*) as c FROM llm_results WHERE smell_commit_id=?",
+                (sc_id,),
+            )).fetchone())["c"]
+
+            if has_results:
+                await db.execute(
+                    "UPDATE smell_commits SET status='completed', updated_at=? WHERE id=?",
+                    (now_iso(), sc_id),
+                )
+                await db.execute(
+                    "UPDATE sessions SET phase2_done=phase2_done+1, updated_at=? WHERE id=?",
+                    (now_iso(), session_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE smell_commits SET status='pending', updated_at=? WHERE id=?",
+                    (now_iso(), sc_id),
+                )
             await db.commit()
 
         async with get_db() as db:

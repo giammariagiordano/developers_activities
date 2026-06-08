@@ -43,6 +43,7 @@ const state = {
   loading: false,
   smellPage: 1,
   smellFilter: '',
+  autoRun: false,
 };
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
@@ -68,7 +69,7 @@ function pct(done, total) {
 function progressBar(done, total, color = 'blue') {
   const p = pct(done, total);
   return `<div class="w-full bg-gray-200 rounded-full h-2 mt-1">
-    <div class="bg-${color}-500 h-2 rounded-full transition-all" style="width:${p}%"></div>
+    <div class="bg-${color}-500 h-2 rounded-full transition-all" style="width:${Math.min(p, 100)}%"></div>
   </div><div class="text-xs text-gray-500 mt-0.5">${done}/${total} (${p}%)</div>`;
 }
 
@@ -240,10 +241,16 @@ function renderSessionPage() {
             <span class="text-gray-300">/</span>
             <h2 class="font-semibold text-gray-900">${s.name}</h2>
             <span id="hdr-status">${badge(s.status)}</span>
-            <div class="ml-auto flex items-center gap-2 text-xs text-gray-500">
-              <span class="font-mono">${s.model}</span>
-              <span>temp=${s.temperature}</span>
-              <span>runs=${s.n_runs}</span>
+            <div class="ml-auto flex items-center gap-3">
+              ${['running','pausing'].includes(s.status) ? `
+                <button onclick="pauseSession()" class="bg-yellow-500 text-white px-3 py-1.5 rounded-lg text-sm font-medium hover:bg-yellow-600 flex items-center gap-1.5">
+                  ⏸ Pause
+                </button>` : ''}
+              <div class="flex items-center gap-2 text-xs text-gray-500">
+                <span class="font-mono">${s.model}</span>
+                <span>temp=${s.temperature}</span>
+                <span>runs=${s.n_runs}</span>
+              </div>
             </div>
           </div>
           <!-- Tabs -->
@@ -276,7 +283,6 @@ function switchTab(tab) {
     }
   });
   el('tab-content').innerHTML = renderTab(tab);
-  if (tab === 'results') setTimeout(renderCharts, 100);
   if (tab === 'data') loadSmells();
 }
 
@@ -617,7 +623,7 @@ function renderData() {
         </div>
       </div>
 
-      <div class="bg-white rounded-xl border shadow-sm overflow-hidden">
+      <div class="bg-white rounded-xl border shadow-sm">
         <div class="px-4 py-3 border-b flex items-center gap-3">
           <input id="smell-filter" placeholder="Filter by smell type, repo, status..." onkeyup="filterSmells()"
             class="flex-1 border rounded-lg px-3 py-1.5 text-sm" />
@@ -628,7 +634,7 @@ function renderData() {
             <option value="failed">Failed</option>
           </select>
         </div>
-        <div id="smells-table">
+        <div id="smells-table" class="overflow-x-auto rounded-b-xl">
           <div class="p-6 text-center text-gray-400 text-sm">Loading...</div>
         </div>
         <div id="smells-pagination" class="px-4 py-3 border-t flex items-center justify-between text-sm text-gray-500"></div>
@@ -654,26 +660,34 @@ function renderSmellsTable(data) {
     return;
   }
   tbl.innerHTML = `
-    <table class="w-full text-xs">
-      <thead class="bg-gray-50 border-b text-gray-500 uppercase tracking-wide">
+    <table class="min-w-max w-full text-xs">
+      <thead class="bg-gray-50 border-b text-gray-500 uppercase tracking-wide whitespace-nowrap">
         <tr>
           <th class="px-4 py-2 text-left">Repository</th>
           <th class="px-4 py-2 text-left">Commit</th>
           <th class="px-4 py-2 text-left">File</th>
           <th class="px-4 py-2 text-left">Smell Type</th>
+          <th class="px-4 py-2 text-left">Line</th>
           <th class="px-4 py-2 text-left">Function</th>
+          <th class="px-4 py-2 text-left">Category</th>
+          <th class="px-4 py-2 text-left">Sub-Activity</th>
           <th class="px-4 py-2 text-left">Status</th>
         </tr>
       </thead>
       <tbody class="divide-y">
         ${data.smells.map(sc => `
           <tr class="hover:bg-gray-50 cursor-pointer" onclick="viewSmellDetail(${sc.id})">
-            <td class="px-4 py-2 font-mono">${sc.repo_id}</td>
-            <td class="px-4 py-2 font-mono text-gray-500">${sc.commit_hash.slice(0,8)}</td>
-            <td class="px-4 py-2 text-gray-600 max-w-xs truncate" title="${sc.file_path}">${sc.file_path}</td>
-            <td class="px-4 py-2 font-medium">${sc.smell_type}</td>
-            <td class="px-4 py-2 text-gray-500">${sc.function_name || '—'}</td>
-            <td class="px-4 py-2">${badge(sc.status)}</td>
+            <td class="px-4 py-2 font-mono whitespace-nowrap text-xs">${sc.repo_name || sc.repo_id}</td>
+            <td class="px-4 py-2 font-mono text-gray-500 whitespace-nowrap">${sc.commit_hash.slice(0,8)}</td>
+            <td class="px-4 py-2 text-gray-600 whitespace-nowrap" style="max-width:220px;overflow:hidden;text-overflow:ellipsis" title="${sc.file_path}">${sc.file_path}</td>
+            <td class="px-4 py-2 font-medium whitespace-nowrap">${sc.smell_type}</td>
+            <td class="px-4 py-2 text-gray-400 whitespace-nowrap font-mono">${sc.smell_line || '—'}</td>
+            <td class="px-4 py-2 text-gray-500 whitespace-nowrap">${sc.function_name || '—'}</td>
+            <td class="px-4 py-2 whitespace-nowrap">${sc.primary_activity
+              ? `<span class="font-medium text-indigo-700">${sc.primary_activity}</span>`
+              : '<span class="text-gray-300">—</span>'}</td>
+            <td class="px-4 py-2 whitespace-nowrap text-gray-600">${sc.sub_activity || '<span class="text-gray-300">—</span>'}</td>
+            <td class="px-4 py-2 whitespace-nowrap">${badge(sc.status)}</td>
           </tr>`).join('')}
       </tbody>
     </table>`;
@@ -724,15 +738,87 @@ async function clearAllSmells() {
 }
 
 async function viewSmellDetail(id) {
-  const detail = await API.get(`/api/sessions/${state.session.id}/smells/${id}`);
-  const votes = detail.votes.map(v => `
-    <div class="border rounded-lg p-3">
-      <div class="font-medium text-sm">${v.pattern_name}</div>
-      <div class="mt-1 text-sm">Winner: <strong>${v.primary_activity || (v.tied ? 'TIE: ' + JSON.parse(v.tied_activities||'[]').join(', ') : '—')}</strong></div>
-      <div class="text-xs text-gray-400">Votes: ${v.vote_count}/${v.total_votes}</div>
-    </div>`).join('');
+  const d = await API.get(`/api/sessions/${state.session.id}/smells/${id}`);
 
-  alert(`Smell #${id}\nType: ${detail.smell_type}\nCommit: ${detail.commit_hash}\n\nVotes:\n${detail.votes.map(v => `${v.pattern_name}: ${v.primary_activity || 'TIE'} (${v.vote_count}/${v.total_votes})`).join('\n')}`);
+  // Pick representative reasoning (first run of first pattern)
+  const rep = d.results && d.results[0];
+  const reasoning = rep ? rep.reasoning : null;
+  const subActivity = rep ? rep.sub_activity : null;
+
+  const voteHtml = (d.votes || []).map(v => {
+    const allVotes = JSON.parse(v.all_votes || '{}');
+    const bars = Object.entries(allVotes).sort((a,b) => b[1]-a[1]).map(([act, cnt]) => `
+      <div class="flex items-center gap-2 text-xs">
+        <span class="w-36 truncate text-gray-600">${act}</span>
+        <div class="flex-1 bg-gray-100 rounded h-2">
+          <div class="bg-indigo-400 h-2 rounded" style="width:${Math.round(cnt/v.total_votes*100)}%"></div>
+        </div>
+        <span class="text-gray-500 w-8 text-right">${cnt}/${v.total_votes}</span>
+      </div>`).join('');
+    return `
+      <div class="border rounded-lg p-3">
+        <div class="flex items-center justify-between mb-2">
+          <span class="font-medium text-sm">${v.pattern_name}</span>
+          <span class="text-xs px-2 py-0.5 rounded-full ${v.tied ? 'bg-yellow-100 text-yellow-700' : 'bg-indigo-100 text-indigo-700'}">
+            ${v.tied ? 'TIE' : v.primary_activity}
+          </span>
+        </div>
+        <div class="space-y-1">${bars}</div>
+      </div>`;
+  }).join('') || '<div class="text-gray-400 text-sm">No votes yet</div>';
+
+  const diffHtml = d.diff_content
+    ? `<pre class="text-xs font-mono bg-gray-950 text-gray-100 p-4 rounded-lg overflow-x-auto whitespace-pre max-h-72 overflow-y-auto">${d.diff_content.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>`
+    : '<div class="text-gray-400 text-sm">No diff available</div>';
+
+  const modal = document.createElement('div');
+  modal.className = 'fixed inset-0 z-50 flex items-center justify-center p-4';
+  modal.innerHTML = `
+    <div class="absolute inset-0 bg-black/50" onclick="this.parentElement.remove()"></div>
+    <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto">
+      <div class="sticky top-0 bg-white border-b px-6 py-4 flex items-start justify-between rounded-t-2xl">
+        <div>
+          <div class="font-semibold text-lg">${d.smell_type}</div>
+          <div class="text-xs text-gray-400 mt-0.5 font-mono">${d.file_path}${d.smell_line ? ':' + d.smell_line : ''} · ${d.commit_hash.slice(0,8)}</div>
+        </div>
+        <button onclick="this.closest('.fixed').remove()" class="text-gray-400 hover:text-gray-600 text-xl ml-4">✕</button>
+      </div>
+      <div class="px-6 py-5 space-y-5">
+
+        <!-- Meta -->
+        <div class="grid grid-cols-2 gap-3 text-sm">
+          <div><span class="text-gray-400">Function:</span> <span class="font-mono">${d.function_name || '—'}</span></div>
+          <div><span class="text-gray-400">Line:</span> <strong>${d.smell_line || '—'}</strong></div>
+          <div class="col-span-2"><span class="text-gray-400">Commit message:</span> <span class="italic">${d.commit_message || '—'}</span></div>
+          <div><span class="text-gray-400">Smell message:</span> <span class="text-orange-600">${d.smell_message || '—'}</span></div>
+        </div>
+
+        <!-- LLM Classification -->
+        ${rep ? `
+        <div>
+          <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">LLM Classification</div>
+          <div class="bg-indigo-50 rounded-lg p-3 space-y-1">
+            <div class="text-sm"><span class="text-gray-500">Category:</span> <strong class="text-indigo-700">${rep.primary_activity || '—'}</strong></div>
+            <div class="text-sm"><span class="text-gray-500">Sub-activity:</span> <span class="text-gray-700">${subActivity || '—'}</span></div>
+          </div>
+          ${reasoning ? `<div class="mt-2 text-sm text-gray-600 italic border-l-2 border-indigo-200 pl-3">${reasoning}</div>` : ''}
+        </div>` : ''}
+
+        <!-- Votes -->
+        <div>
+          <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Vote Breakdown</div>
+          ${voteHtml}
+        </div>
+
+        <!-- Diff -->
+        <div>
+          <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Code Diff</div>
+          ${diffHtml}
+        </div>
+
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
 }
 
 // ─── Tab: Run ─────────────────────────────────────────────────────────────────
@@ -742,7 +828,16 @@ function renderRun() {
   const running = ['running', 'pausing'].includes(s.status);
   return `
     <div class="max-w-3xl">
-      <h3 class="font-semibold text-lg mb-4">Pipeline Execution</h3>
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-semibold text-lg">Pipeline Execution</h3>
+        ${!running ? `
+          <button onclick="startAllPhases()" class="bg-indigo-600 text-white px-5 py-2 rounded-lg hover:bg-indigo-700 font-medium text-sm flex items-center gap-2">
+            ▶▶ Run All Phases
+          </button>` : `
+          <div class="flex items-center gap-2 text-xs text-indigo-600 font-medium">
+            ${state.autoRun ? '<span class="animate-pulse">● Auto-running all phases…</span>' : ''}
+          </div>`}
+      </div>
 
       <!-- Phase 1 -->
       <div class="bg-white rounded-xl border shadow-sm p-5 mb-4">
@@ -759,7 +854,13 @@ function renderRun() {
               </button>` : ''}
           </div>
         </div>
-        ${progressBar(s.phase1_done, s.phase1_total || 1, 'blue')}
+        ${(() => {
+          const scanned = state.repos.filter(r => ['scanned','error'].includes(r.status)).length;
+          const total = state.repos.length || 1;
+          const smellCount = s.phase1_done || 0;
+          return progressBar(scanned, total, 'blue') +
+            (smellCount ? `<div class="text-xs text-blue-600 mt-1">${smellCount} smell instance${smellCount !== 1 ? 's' : ''} found</div>` : '');
+        })()}
         <div id="repo-progress" class="mt-3 space-y-1.5">
           ${state.repos.map(r => `
             <div class="flex items-center gap-2 text-xs">
@@ -788,6 +889,27 @@ function renderRun() {
           </div>
         </div>
         ${progressBar(s.phase2_done, s.phase2_total || 1, 'green')}
+      </div>
+
+      <!-- Phase 3 -->
+      <div class="bg-white rounded-xl border shadow-sm p-5 mb-4">
+        <div class="flex items-center justify-between mb-1">
+          <div>
+            <h4 class="font-semibold">Phase 3: Sub-Activity Normalization</h4>
+            <p class="text-xs text-gray-400 mt-0.5">Harmonize synonym sub-activity labels via LLM (run after Phase 2 completes)</p>
+          </div>
+          <div class="flex items-center gap-2">
+            ${badge(s.phase3_status || 'idle')}
+            ${!running && s.phase2_status === 'completed' ? `
+              <button onclick="startPhase3()" class="bg-purple-600 text-white px-4 py-1.5 rounded-lg text-sm hover:bg-purple-700">
+                ${s.phase3_status === 'completed' ? '↺ Re-run' : '▶ Start'} Phase 3
+              </button>` : ''}
+          </div>
+        </div>
+        ${s.phase3_status === 'completed' ? `
+          <div class="mt-2">
+            <button onclick="showMappingTable()" class="text-xs text-purple-600 hover:underline">View mapping table →</button>
+          </div>` : ''}
       </div>
 
       <!-- Controls -->
@@ -829,6 +951,58 @@ async function startPhase2() {
   } catch(e) { addLog(`Error: ${e.message}`, 'error'); }
 }
 
+async function startPhase3() {
+  try {
+    const r = await API.post(`/api/sessions/${state.session.id}/start-phase3`);
+    addLog(`Phase 3 normalization started`, 'success');
+    await refreshSession();
+    renderSessionPage();
+    switchTab('run');
+  } catch(e) { addLog(`Error: ${e.message}`, 'error'); }
+}
+
+async function startAllPhases() {
+  state.autoRun = true;
+  addLog('Auto-run: starting all phases sequentially', 'info');
+  await startPhase1();
+}
+
+async function showMappingTable() {
+  const data = await API.get(`/api/sessions/${state.session.id}/phase3/mapping`);
+  const groups = data.groups || [];
+  if (!groups.length) { alert('No mapping data yet.'); return; }
+
+  const rows = groups.map(g => `
+    <tr class="border-b">
+      <td class="px-4 py-2 font-medium text-purple-700 align-top whitespace-nowrap">${g.canonical}</td>
+      <td class="px-4 py-2 text-gray-500 text-xs">${g.raws.map(r => `<span class="inline-block bg-gray-100 rounded px-1.5 py-0.5 mr-1 mb-1">${r}</span>`).join('')}</td>
+    </tr>`).join('');
+
+  const modal = document.createElement('div');
+  modal.className = 'fixed inset-0 z-50 flex items-center justify-center p-4';
+  modal.innerHTML = `
+    <div class="absolute inset-0 bg-black/50" onclick="this.parentElement.remove()"></div>
+    <div class="relative bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] overflow-hidden flex flex-col">
+      <div class="px-6 py-4 border-b flex items-center justify-between">
+        <div class="font-semibold">Sub-Activity Normalization Map</div>
+        <button onclick="this.closest('.fixed').remove()" class="text-gray-400 hover:text-gray-600 text-xl">✕</button>
+      </div>
+      <div class="overflow-y-auto flex-1">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-50 border-b text-xs text-gray-500 uppercase sticky top-0">
+            <tr>
+              <th class="px-4 py-2 text-left whitespace-nowrap">Canonical Label</th>
+              <th class="px-4 py-2 text-left">Raw Labels (merged)</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div class="px-6 py-3 border-t text-xs text-gray-400">${groups.length} canonical labels from ${data.mapping.length} raw labels</div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
 async function pauseSession() {
   await API.post(`/api/sessions/${state.session.id}/pause`);
   addLog('Pause requested...', 'warn');
@@ -836,132 +1010,351 @@ async function pauseSession() {
 
 // ─── Tab: Results ─────────────────────────────────────────────────────────────
 
+const ACT_COLORS = {
+  'Feature Introduction': '#3b82f6',
+  'Bug Fixing': '#ef4444',
+  'Enhancement': '#f59e0b',
+  'Refactoring': '#8b5cf6',
+  'Unclassified': '#9ca3af',
+  'Unknown': '#9ca3af',
+};
+const ACT_LIST = ['Feature Introduction', 'Bug Fixing', 'Enhancement', 'Refactoring'];
+const ACT_LIST_FULL = ['Feature Introduction', 'Bug Fixing', 'Enhancement', 'Refactoring', 'Unclassified'];
+
 function renderResults() {
   const s = state.session;
+  const repos = state.repos || [];
   return `
-    <div class="max-w-5xl">
-      <div class="flex items-center justify-between mb-4">
+    <div class="max-w-6xl">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
         <h3 class="font-semibold text-lg">Results</h3>
-        <div class="flex gap-2">
+        <div class="flex items-center gap-2 flex-wrap">
+          <select id="results-repo-filter" onchange="refreshResults()" class="border rounded-lg px-3 py-1.5 text-sm">
+            <option value="">All Repositories</option>
+            ${repos.map(r => `<option value="${r.id}">${r.owner}/${r.name}</option>`).join('')}
+          </select>
           <button onclick="refreshResults()" class="border px-3 py-1.5 rounded-lg text-sm hover:bg-gray-50">↻ Refresh</button>
-          <a href="/api/sessions/${s.id}/export" class="bg-blue-600 text-white px-4 py-1.5 rounded-lg text-sm hover:bg-blue-700">
+          <a href="/api/sessions/${s.id}/export" download class="bg-blue-600 text-white px-4 py-1.5 rounded-lg text-sm hover:bg-blue-700">
             ↓ Export CSV
           </a>
         </div>
       </div>
       <div id="results-content">
-        <div class="text-center text-gray-400 py-8">Loading results...</div>
+        <div class="text-center text-gray-400 py-8">Loading results…</div>
       </div>
     </div>`;
 }
 
 async function refreshResults() {
-  const data = await API.get(`/api/sessions/${state.session.id}/results/summary`);
-  state.results = data;
-  renderResultsContent(data);
-  setTimeout(renderCharts, 100);
+  const repoId = el('results-repo-filter')?.value || '';
+  const url = `/api/sessions/${state.session.id}/results/charts${repoId ? '?repo_id=' + repoId : ''}`;
+  const summaryUrl = `/api/sessions/${state.session.id}/results/summary`;
+  const [charts, summary] = await Promise.all([API.get(url), API.get(summaryUrl)]);
+  state.results = { charts, summary };
+  renderResultsContent(charts, summary);
 }
 
-function renderResultsContent(data) {
+function _chartCard(id, title, subtitle, downloadId) {
+  return `
+    <div class="bg-white rounded-xl border shadow-sm p-4">
+      <div class="flex items-center justify-between mb-1">
+        <div>
+          <div class="font-medium text-sm">${title}</div>
+          ${subtitle ? `<div class="text-xs text-gray-400">${subtitle}</div>` : ''}
+        </div>
+        <button onclick="downloadChart('${downloadId}')" title="Download PNG"
+          class="text-gray-400 hover:text-gray-600 text-xs border rounded px-2 py-0.5 hover:bg-gray-50">↓ PNG</button>
+      </div>
+      <canvas id="${id}" class="mt-3"></canvas>
+    </div>`;
+}
+
+function renderResultsContent(charts, summary) {
   const rc = el('results-content');
   if (!rc) return;
 
-  const ACTIVITIES = ['Feature Introduction', 'Bug Fixing', 'Enhancement', 'Refactoring'];
-  const COLORS = { 'Feature Introduction': '#3b82f6', 'Bug Fixing': '#ef4444', 'Enhancement': '#f59e0b', 'Refactoring': '#8b5cf6', 'Unknown': '#9ca3af' };
-
-  const tokenCost = (inp, out) => {
-    const cost = (inp / 1e6 * 0.15) + (out / 1e6 * 0.60);
-    return `$${cost.toFixed(4)}`;
-  };
-
-  const statusSummary = Object.entries(data.smell_status || {}).map(([k, v]) =>
+  const tokenCost = (inp, out) => `$${((inp/1e6*0.15)+(out/1e6*0.60)).toFixed(4)}`;
+  const statusSummary = Object.entries(summary.smell_status || {}).map(([k,v]) =>
     `<div class="flex justify-between text-sm"><span>${badge(k)}</span><span class="font-medium">${v}</span></div>`
-  ).join('');
+  ).join('') || '<div class="text-gray-400 text-sm">No data</div>';
 
   rc.innerHTML = `
-    <!-- Stats row -->
-    <div class="grid grid-cols-3 gap-4 mb-6">
+    <!-- KPI row -->
+    <div class="grid grid-cols-4 gap-3 mb-6">
       <div class="bg-white rounded-xl border shadow-sm p-4">
         <div class="text-xs text-gray-500 uppercase tracking-wide font-medium mb-2">Smell Instances</div>
-        <div class="space-y-1.5">${statusSummary || '<div class="text-gray-400 text-sm">No data</div>'}</div>
+        <div class="space-y-1">${statusSummary}</div>
       </div>
       <div class="bg-white rounded-xl border shadow-sm p-4">
         <div class="text-xs text-gray-500 uppercase tracking-wide font-medium mb-2">Token Usage</div>
         <div class="text-sm space-y-1">
-          <div class="flex justify-between"><span>Input tokens</span><span class="font-medium">${(data.tokens?.input || 0).toLocaleString()}</span></div>
-          <div class="flex justify-between"><span>Output tokens</span><span class="font-medium">${(data.tokens?.output || 0).toLocaleString()}</span></div>
-          <div class="flex justify-between border-t pt-1 mt-1"><span>Est. cost (gpt-4o-mini)</span><span class="font-medium text-green-600">${tokenCost(data.tokens?.input||0, data.tokens?.output||0)}</span></div>
+          <div class="flex justify-between"><span>Input</span><span class="font-medium">${(summary.tokens?.input||0).toLocaleString()}</span></div>
+          <div class="flex justify-between"><span>Output</span><span class="font-medium">${(summary.tokens?.output||0).toLocaleString()}</span></div>
+          <div class="flex justify-between border-t pt-1 mt-1 text-green-600 font-medium"><span>Est. cost</span><span>${tokenCost(summary.tokens?.input||0,summary.tokens?.output||0)}</span></div>
         </div>
       </div>
       <div class="bg-white rounded-xl border shadow-sm p-4">
-        <div class="text-xs text-gray-500 uppercase tracking-wide font-medium mb-2">Patterns</div>
-        <div class="text-sm space-y-1">
-          ${(data.patterns || []).map(p => `
-            <div class="flex justify-between items-center">
-              <span class="${p.enabled ? '' : 'text-gray-400 line-through'}">${p.pattern_name}</span>
-              <span class="text-xs text-gray-500">${p.total} classified</span>
-            </div>`).join('')}
-        </div>
+        <div class="text-xs text-gray-500 uppercase tracking-wide font-medium mb-2">Smell Types</div>
+        <div class="text-2xl font-bold text-gray-800">${charts.smell_dist?.length || 0}</div>
+        <div class="text-xs text-gray-400">distinct types found</div>
+      </div>
+      <div class="bg-white rounded-xl border shadow-sm p-4">
+        <div class="text-xs text-gray-500 uppercase tracking-wide font-medium mb-2">Sub-Activities</div>
+        <div class="text-2xl font-bold text-gray-800">${charts.sub_dist?.length || 0}</div>
+        <div class="text-xs text-gray-400">distinct labels (normalized)</div>
       </div>
     </div>
 
-    <!-- Per-pattern charts -->
-    <div class="grid grid-cols-${Math.min(data.patterns?.length || 1, 2)} gap-4">
-      ${(data.patterns || []).map(p => `
+    <!-- Row 1: activity donut + smell type bar -->
+    <div class="grid grid-cols-2 gap-4 mb-4">
+      ${_chartCard('chart-activity', 'Activity Distribution', 'Primary activity across all smell commits', 'chart-activity')}
+      ${_chartCard('chart-smell-type', 'Smell Type Frequency', 'Most common ML code smells', 'chart-smell-type')}
+    </div>
+
+    <!-- Row 2: sub-activity bar + smell×activity heatmap -->
+    <div class="grid grid-cols-2 gap-4 mb-4">
+      ${_chartCard('chart-subactivity', 'Top Sub-Activities', 'Top 20 normalized sub-activity labels', 'chart-subactivity')}
+      ${_chartCard('chart-cross', 'Smell Type × Activity', 'Stacked distribution per smell type', 'chart-cross')}
+    </div>
+
+    <!-- Row 3: temporal full width -->
+    <div class="mb-4">
+      <div class="bg-white rounded-xl border shadow-sm p-4">
+        <div class="flex items-center justify-between mb-1">
+          <div>
+            <div class="font-medium text-sm">Temporal Evolution</div>
+            <div class="text-xs text-gray-400">Cumulative smell count over time — one line per smell type</div>
+          </div>
+          <div class="flex items-center gap-2">
+            <button onclick="backfillDates()" id="btn-backfill"
+              class="text-indigo-600 hover:text-indigo-800 text-xs border border-indigo-200 rounded px-2 py-0.5 hover:bg-indigo-50"
+              title="Populate commit dates from git history (needed if smells were scanned before this feature was added)">
+              ↺ Backfill dates
+            </button>
+            <button onclick="downloadChart('chart-temporal')" class="text-gray-400 hover:text-gray-600 text-xs border rounded px-2 py-0.5 hover:bg-gray-50">↓ PNG</button>
+          </div>
+        </div>
+        <canvas id="chart-temporal" class="mt-3"></canvas>
+      </div>
+    </div>
+
+    <!-- Row 4: per-repo (if multiple repos) -->
+    ${charts.repos?.length > 1 ? `
+    <div class="mb-4">
+      ${_chartCard('chart-repo', 'Per-Repository Activity', 'Activity distribution per repository', 'chart-repo')}
+    </div>` : ''}
+
+    <!-- Per-pattern section -->
+    <div class="mb-2 mt-6 text-xs font-semibold text-gray-500 uppercase tracking-wide">Per Prompt Pattern</div>
+    <div class="grid grid-cols-${Math.min(summary.patterns?.length||1,2)} gap-4">
+      ${(summary.patterns||[]).map(p => `
         <div class="bg-white rounded-xl border shadow-sm p-4">
-          <div class="font-medium text-sm mb-1">${p.pattern_name}</div>
-          <div class="text-xs text-gray-400 mb-3">${p.total} smell commits classified${p.tied_count > 0 ? ` • ${p.tied_count} tied` : ''}</div>
-          <canvas id="chart-${p.pattern_id}" height="200"></canvas>
+          <div class="flex items-center justify-between mb-1">
+            <div>
+              <div class="font-medium text-sm">${p.pattern_name}</div>
+              <div class="text-xs text-gray-400">${p.total} classified${p.tied_count>0?` · ${p.tied_count} tied`:''}</div>
+            </div>
+            <button onclick="downloadChart('chart-pat-${p.pattern_id}')" class="text-gray-400 hover:text-gray-600 text-xs border rounded px-2 py-0.5 hover:bg-gray-50">↓ PNG</button>
+          </div>
+          <canvas id="chart-pat-${p.pattern_id}" height="200"></canvas>
           <div class="mt-3 space-y-1">
-            ${ACTIVITIES.map(act => {
-              const count = p.distribution[act] || 0;
-              const pct2 = p.total ? Math.round(count/p.total*100) : 0;
+            ${ACT_LIST.map(act => {
+              const c = p.distribution[act]||0;
+              const pct2 = p.total ? Math.round(c/p.total*100) : 0;
               return `<div class="flex items-center gap-2 text-xs">
-                <div class="w-3 h-3 rounded-sm flex-shrink-0" style="background:${COLORS[act]}"></div>
+                <div class="w-3 h-3 rounded-sm flex-shrink-0" style="background:${ACT_COLORS[act]}"></div>
                 <span class="flex-1">${act}</span>
-                <span class="font-medium">${count}</span>
+                <span class="font-medium">${c}</span>
                 <span class="text-gray-400 w-8 text-right">${pct2}%</span>
               </div>`;
             }).join('')}
           </div>
         </div>`).join('')}
     </div>`;
+
+  setTimeout(() => renderAllCharts(charts, summary), 50);
 }
 
-function renderCharts() {
-  if (!state.results) return;
-  const ACTIVITIES = ['Feature Introduction', 'Bug Fixing', 'Enhancement', 'Refactoring'];
-  const COLORS = ['#3b82f6', '#ef4444', '#f59e0b', '#8b5cf6'];
+function _destroyChart(id) {
+  if (state.charts[id]) { state.charts[id].destroy(); delete state.charts[id]; }
+}
 
-  for (const p of (state.results.patterns || [])) {
-    const canvas = el(`chart-${p.pattern_id}`);
-    if (!canvas) continue;
-
-    if (state.charts[p.pattern_id]) {
-      state.charts[p.pattern_id].destroy();
-    }
-
-    state.charts[p.pattern_id] = new Chart(canvas, {
+function renderAllCharts(charts, summary) {
+  // 1. Activity donut
+  _destroyChart('activity');
+  const actCanvas = el('chart-activity');
+  if (actCanvas) {
+    const labels = Object.keys(charts.activity_dist||{});
+    const vals = Object.values(charts.activity_dist||{});
+    state.charts['activity'] = new Chart(actCanvas, {
       type: 'doughnut',
-      data: {
-        labels: ACTIVITIES,
-        datasets: [{
-          data: ACTIVITIES.map(a => p.distribution[a] || 0),
-          backgroundColor: COLORS,
-          borderWidth: 2,
-          borderColor: '#fff',
-        }],
-      },
+      data: { labels, datasets: [{ data: vals, backgroundColor: labels.map(l=>ACT_COLORS[l]||'#9ca3af'), borderWidth: 2, borderColor: '#fff' }] },
+      options: { responsive: true, plugins: { legend: { position: 'right' }, tooltip: { callbacks: { label: ctx => `${ctx.label}: ${ctx.raw} (${vals.reduce((a,b)=>a+b,0)?Math.round(ctx.raw/vals.reduce((a,b)=>a+b,0)*100):0}%)` } } }, cutout: '55%' },
+    });
+  }
+
+  // 2. Smell type bar
+  _destroyChart('smell-type');
+  const stCanvas = el('chart-smell-type');
+  if (stCanvas && charts.smell_dist?.length) {
+    const labels = charts.smell_dist.map(d=>d.smell_type);
+    const vals = charts.smell_dist.map(d=>d.count);
+    state.charts['smell-type'] = new Chart(stCanvas, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: 'Occurrences', data: vals, backgroundColor: '#6366f1', borderRadius: 4 }] },
+      options: { indexAxis: 'y', responsive: true, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } },
+    });
+  }
+
+  // 3. Sub-activity horizontal bar
+  _destroyChart('subactivity');
+  const saCanvas = el('chart-subactivity');
+  if (saCanvas && charts.sub_dist?.length) {
+    const labels = charts.sub_dist.map(d=>d.sub_activity);
+    const vals = charts.sub_dist.map(d=>d.count);
+    state.charts['subactivity'] = new Chart(saCanvas, {
+      type: 'bar',
+      data: { labels, datasets: [{ label: 'Count', data: vals, backgroundColor: '#f59e0b', borderRadius: 4 }] },
+      options: { indexAxis: 'y', responsive: true, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } },
+    });
+  }
+
+  // 4. Cross matrix stacked bar (smell_type × activity)
+  _destroyChart('cross');
+  const crossCanvas = el('chart-cross');
+  if (crossCanvas && charts.cross_matrix?.length) {
+    const smellTypes = [...new Set(charts.cross_matrix.map(r=>r.smell_type))];
+    const datasets = ACT_LIST.map(act => ({
+      label: act,
+      data: smellTypes.map(st => {
+        const row = charts.cross_matrix.find(r=>r.smell_type===st && r.activity===act);
+        return row ? row.count : 0;
+      }),
+      backgroundColor: ACT_COLORS[act],
+      borderRadius: 2,
+    }));
+    state.charts['cross'] = new Chart(crossCanvas, {
+      type: 'bar',
+      data: { labels: smellTypes, datasets },
+      options: { responsive: true, scales: { x: { stacked: true, ticks: { maxRotation: 45, font: { size: 10 } } }, y: { stacked: true, beginAtZero: true } }, plugins: { legend: { position: 'bottom' } } },
+    });
+  }
+
+  // 5. Temporal: cumulative smell diffusion per type (line chart)
+  _destroyChart('temporal');
+  const tempCanvas = el('chart-temporal');
+  if (tempCanvas && charts.temporal?.length) {
+    const months = [...new Set(charts.temporal.map(r=>r.month))].sort();
+    const smellTypes = [...new Set(charts.temporal.map(r=>r.smell_type))].sort();
+    const PALETTE = [
+      '#3b82f6','#ef4444','#f59e0b','#8b5cf6','#10b981','#f97316',
+      '#06b6d4','#ec4899','#84cc16','#6366f1','#14b8a6','#a855f7',
+    ];
+    // Build cumulative per smell type
+    const datasets = smellTypes.map((st, i) => {
+      let cumulative = 0;
+      const data = months.map(m => {
+        const row = charts.temporal.find(r => r.month === m && r.smell_type === st);
+        cumulative += row ? row.count : 0;
+        return cumulative;
+      });
+      const color = PALETTE[i % PALETTE.length];
+      return {
+        label: st,
+        data,
+        borderColor: color,
+        backgroundColor: color + '18',
+        fill: false,
+        tension: 0.3,
+        pointRadius: months.length < 30 ? 3 : 1,
+        borderWidth: 2,
+      };
+    });
+    state.charts['temporal'] = new Chart(tempCanvas, {
+      type: 'line',
+      data: { labels: months, datasets },
       options: {
         responsive: true,
-        plugins: {
-          legend: { display: false },
-          tooltip: { callbacks: { label: ctx => `${ctx.label}: ${ctx.raw} (${p.total ? Math.round(ctx.raw/p.total*100) : 0}%)` } },
+        scales: {
+          x: { ticks: { maxRotation: 45, font: { size: 10 } } },
+          y: { beginAtZero: true, ticks: { precision: 0 }, title: { display: true, text: 'Cumulative smell count' } },
         },
-        cutout: '60%',
+        plugins: {
+          legend: { position: 'bottom', labels: { font: { size: 10 }, boxWidth: 12 } },
+          tooltip: { mode: 'index', intersect: false },
+        },
+        interaction: { mode: 'index', intersect: false },
       },
     });
   }
+
+  // 6. Per-repo stacked bar
+  _destroyChart('repo');
+  const repoCanvas = el('chart-repo');
+  if (repoCanvas && charts.per_repo?.length) {
+    const repos = [...new Set(charts.per_repo.map(r=>r.repo))];
+    const acts = [...new Set(charts.per_repo.map(r=>r.activity))];
+    const datasets = ACT_LIST_FULL.filter(a => acts.includes(a)).map(act => ({
+      label: act,
+      data: repos.map(repo => {
+        const rows = charts.per_repo.filter(r=>r.repo===repo && r.activity===act);
+        return rows.reduce((s,r)=>s+r.count,0);
+      }),
+      backgroundColor: ACT_COLORS[act] || '#9ca3af',
+      borderRadius: 3,
+    }));
+    state.charts['repo'] = new Chart(repoCanvas, {
+      type: 'bar',
+      data: { labels: repos, datasets },
+      options: {
+        responsive: true,
+        scales: {
+          x: { stacked: true, ticks: { maxRotation: 30, font: { size: 10 } } },
+          y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } },
+        },
+        plugins: { legend: { position: 'bottom' } },
+      },
+    });
+  }
+
+  // 7. Per-pattern donuts
+  for (const p of (summary.patterns||[])) {
+    _destroyChart(`pat-${p.pattern_id}`);
+    const c = el(`chart-pat-${p.pattern_id}`);
+    if (!c) continue;
+    state.charts[`pat-${p.pattern_id}`] = new Chart(c, {
+      type: 'doughnut',
+      data: { labels: ACT_LIST, datasets: [{ data: ACT_LIST.map(a=>p.distribution[a]||0), backgroundColor: ACT_LIST.map(a=>ACT_COLORS[a]), borderWidth: 2, borderColor: '#fff' }] },
+      options: { responsive: true, plugins: { legend: { display: false } }, cutout: '60%' },
+    });
+  }
+}
+
+async function backfillDates() {
+  const btn = el('btn-backfill');
+  if (btn) { btn.textContent = '…'; btn.disabled = true; }
+  try {
+    const r = await API.post(`/api/sessions/${state.session.id}/backfill-commit-dates`);
+    addLog(`Backfill complete: ${r.updated} smell commits updated with commit date`, 'success');
+    await refreshResults();
+  } catch(e) {
+    addLog(`Backfill error: ${e.message}`, 'error');
+  } finally {
+    if (btn) { btn.textContent = '↺ Backfill dates'; btn.disabled = false; }
+  }
+}
+
+function downloadChart(canvasId) {
+  const canvas = el(canvasId);
+  if (!canvas) return;
+  const link = document.createElement('a');
+  link.download = `${canvasId}.png`;
+  link.href = canvas.toDataURL('image/png');
+  link.click();
+}
+
+function renderCharts() {
+  if (state.results) renderAllCharts(state.results.charts, state.results.summary);
 }
 
 // ─── SSE Event Handling ───────────────────────────────────────────────────────
@@ -1010,12 +1403,33 @@ function handleSSEMessage(msg) {
 
     case 'phase1_complete':
       addLog(`Phase 1 complete! Found ${msg.smell_count} smell instances.`, 'success');
-      refreshSession();
+      refreshSession().then(() => {
+        if (state.autoRun) {
+          addLog('Auto-run: starting Phase 2…', 'info');
+          startPhase2();
+        }
+      });
       break;
 
     case 'phase2_complete':
       addLog('Phase 2 complete! All smell commits classified.', 'success');
+      refreshSession().then(() => {
+        if (state.autoRun) {
+          addLog('Auto-run: starting Phase 3…', 'info');
+          startPhase3();
+        }
+      });
+      break;
+
+    case 'phase3_complete':
+      addLog(`Phase 3 complete! ${msg.mapped} labels normalized.`, 'success');
+      state.autoRun = false;
       refreshSession();
+      if (state.tab === 'data') loadSmells(state.smellPage);
+      break;
+
+    case 'phase3_progress':
+      if (msg.pass) addLog(`Phase 3 pass ${msg.pass}: ${msg.done}/${msg.total}`, 'info');
       break;
 
     case 'repo_status':
@@ -1108,8 +1522,13 @@ window.loadSmells = loadSmells;
 window.viewSmellDetail = viewSmellDetail;
 window.startPhase1 = startPhase1;
 window.startPhase2 = startPhase2;
+window.startPhase3 = startPhase3;
+window.startAllPhases = startAllPhases;
+window.showMappingTable = showMappingTable;
 window.pauseSession = pauseSession;
 window.refreshResults = refreshResults;
+window.downloadChart = downloadChart;
+window.backfillDates = backfillDates;
 window.importReposCSV = importReposCSV;
 window.importLocalPath = importLocalPath;
 window.clearAllRepos = clearAllRepos;
