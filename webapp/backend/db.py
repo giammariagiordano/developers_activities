@@ -135,6 +135,11 @@ async def init_db():
         for migration in [
             "ALTER TABLE sessions ADD COLUMN phase3_status TEXT NOT NULL DEFAULT 'idle'",
             "ALTER TABLE smell_commits ADD COLUMN commit_date TEXT",
+            "ALTER TABLE sessions ADD COLUMN classifier_models TEXT NOT NULL DEFAULT '[\"gemma3:12b\",\"qwen2.5:7b\",\"mistral:7b\"]'",
+            "ALTER TABLE sessions ADD COLUMN aggregator_model TEXT NOT NULL DEFAULT 'llama3.1:8b'",
+            "ALTER TABLE sessions ADD COLUMN ollama_base_url TEXT NOT NULL DEFAULT 'http://localhost:11434'",
+            "ALTER TABLE llm_results ADD COLUMN model_name TEXT",
+            "ALTER TABLE sessions ADD COLUMN llm_api_key TEXT",
         ]:
             try:
                 await db.execute(migration)

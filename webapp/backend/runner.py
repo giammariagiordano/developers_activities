@@ -6,13 +6,14 @@ Async orchestration for both phases:
 import asyncio
 import json
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from .db import get_db, now_iso
 from .git_client import clone_or_update, get_commits, get_file_diff, extract_diff_around_line
 from .codesmile_runner import scan_repo_commits
-from .llm_client import run_llm_query, build_prompt, compute_majority_vote, run_normalization_batch
+from .llm_client import run_ollama_query, run_aggregator, build_prompt, run_normalization_batch
 
 # Global: active asyncio tasks per session
 _active: dict[int, asyncio.Task] = {}
@@ -141,10 +142,13 @@ async def _run_phase3(session_id: int):
 
         # Pass 1: normalize unique lowercased labels → intermediate canonicals
         BATCH_SIZE = 50
+        agg_model = sess.get("aggregator_model") or "llama3.1:8b"
+        base_url = sess.get("ollama_base_url") or "http://localhost:11434"
+        api_key = sess.get("llm_api_key") or "ollama"
         pass1: dict[str, str] = {}
         for i in range(0, len(unique_for_llm), BATCH_SIZE):
             batch = unique_for_llm[i: i + BATCH_SIZE]
-            mappings = await run_normalization_batch(batch, sess["model"], sess["openai_api_key"])
+            mappings = await run_normalization_batch(batch, agg_model, base_url, api_key)
             pass1.update(mappings)
             await _broadcast(session_id, "phase3_progress", {
                 "total": len(unique_for_llm),
@@ -153,12 +157,11 @@ async def _run_phase3(session_id: int):
             })
 
         # Pass 2: normalize the intermediate canonicals themselves
-        # (merges near-duplicates like "test case" / "test cases")
         intermediate_canonicals = list(set(pass1.values()))
         pass2: dict[str, str] = {}
         for i in range(0, len(intermediate_canonicals), BATCH_SIZE):
             batch = intermediate_canonicals[i: i + BATCH_SIZE]
-            mappings = await run_normalization_batch(batch, sess["model"], sess["openai_api_key"])
+            mappings = await run_normalization_batch(batch, agg_model, base_url, api_key)
             pass2.update(mappings)
             await _broadcast(session_id, "phase3_progress", {
                 "total": len(intermediate_canonicals),
@@ -534,6 +537,7 @@ async def _run_phase2(session_id: int):
         await _broadcast(session_id, "status", {"status": "running", "phase": 2})
 
         sem = asyncio.Semaphore(sess.get("max_parallel_llm", 20))
+        agg_sem = asyncio.Semaphore(max(2, (sess.get("max_parallel_llm") or 6) // 3))
 
         while True:
             # Pause check
@@ -584,7 +588,7 @@ async def _run_phase2(session_id: int):
                 await db.commit()
 
             await asyncio.gather(*[
-                _classify_smell(sc, sess, sem) for sc in batch
+                _classify_smell(sc, sess, sem, agg_sem) for sc in batch
             ], return_exceptions=True)
 
     except Exception as e:
@@ -597,7 +601,7 @@ async def _run_phase2(session_id: int):
         await _broadcast(session_id, "error", {"message": str(e)})
 
 
-async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore):
+async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore, agg_sem: asyncio.Semaphore):
     sc_id = sc["id"]
     session_id = sc["session_id"]
 
@@ -615,7 +619,6 @@ async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore):
                 _executor, get_file_diff,
                 repo["local_path"], sc["prev_commit_hash"], sc["commit_hash"], sc["file_path"]
             )
-            # Extract context around smelly line
             diff = extract_diff_around_line(raw_diff, sc.get("smell_line"), context=40)
             async with get_db() as db:
                 await db.execute(
@@ -636,49 +639,18 @@ async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore):
         if not patterns:
             raise ValueError("No enabled prompt patterns")
 
-        # Build all (pattern, run) pairs, skip existing
-        async with get_db() as db:
-            calls = []
-            for p in patterns:
-                for run in range(sess["n_runs"]):
-                    exists = await (await db.execute(
-                        "SELECT id FROM llm_results WHERE smell_commit_id=? AND prompt_pattern_id=? AND run_number=?",
-                        (sc_id, p["id"], run),
-                    )).fetchone()
-                    if not exists:
-                        calls.append((p, run))
+        classifier_models = json.loads(sess.get("classifier_models") or '["gemma3:12b","qwen2.5:7b","mistral:7b"]')
+        aggregator_model = sess.get("aggregator_model") or "llama3.1:8b"
+        base_url = sess.get("ollama_base_url") or "http://localhost:11434"
+        api_key = sess.get("llm_api_key") or "ollama"
+        temperature = sess.get("temperature", 0.0)
 
-        # Parallel LLM calls (bounded)
-        await asyncio.gather(*[
-            _single_llm_call(sc, p, run, sess, sem) for p, run in calls
-        ], return_exceptions=True)
-
-        # Compute majority vote per pattern
         for p in patterns:
-            async with get_db() as db:
-                res_rows = await (await db.execute(
-                    "SELECT * FROM llm_results WHERE smell_commit_id=? AND prompt_pattern_id=?",
-                    (sc_id, p["id"]),
-                )).fetchall()
-            results = [dict(r) for r in res_rows]
-            if results:
-                vote = compute_majority_vote(results)
-                async with get_db() as db:
-                    await db.execute(
-                        """INSERT OR REPLACE INTO vote_results
-                           (smell_commit_id, prompt_pattern_id, primary_activity,
-                            vote_count, total_votes, tied, tied_activities, all_votes, created_at)
-                           VALUES (?,?,?,?,?,?,?,?,?)""",
-                        (sc_id, p["id"], vote["primary_activity"],
-                         vote["vote_count"], vote["total_votes"],
-                         1 if vote["tied"] else 0,
-                         json.dumps(vote["tied_activities"]),
-                         json.dumps(vote["all_votes"]),
-                         now_iso()),
-                    )
-                    await db.commit()
+            await _classify_smell_pattern(
+                sc, p, sess, classifier_models, aggregator_model, base_url, api_key, temperature, sem, agg_sem
+            )
 
-        # Only mark completed if at least one LLM result was stored
+        # Mark completed if at least one result stored
         async with get_db() as db:
             has_results = (await (await db.execute(
                 "SELECT COUNT(*) as c FROM llm_results WHERE smell_commit_id=?",
@@ -720,24 +692,101 @@ async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore):
         await _broadcast(session_id, "task_failed", {"sc_id": sc_id, "error": str(e)})
 
 
-async def _single_llm_call(sc: dict, pattern: dict, run_num: int, sess: dict, sem: asyncio.Semaphore):
-    async with sem:
-        prompt = build_prompt(pattern["template"], sc)
-        result = await run_llm_query(
-            prompt=prompt,
-            model=sess["model"],
-            temperature=sess["temperature"],
-            api_key=sess["openai_api_key"],
-        )
-        async with get_db() as db:
+async def _classify_smell_pattern(
+    sc: dict, pattern: dict, sess: dict,
+    classifier_models: list[str], aggregator_model: str,
+    base_url: str, api_key: str, temperature: float, sem: asyncio.Semaphore,
+    agg_sem: asyncio.Semaphore,
+):
+    sc_id = sc["id"]
+    pattern_id = pattern["id"]
+
+    # Skip if aggregated result already exists for this pattern
+    async with get_db() as db:
+        already = await (await db.execute(
+            "SELECT id FROM llm_results WHERE smell_commit_id=? AND prompt_pattern_id=? AND run_number=99",
+            (sc_id, pattern_id),
+        )).fetchone()
+    if already:
+        return
+
+    prompt = build_prompt(pattern["template"], sc)
+
+    # Run 3 classifiers in parallel (each acquires semaphore slot independently)
+    async def _call_classifier(model_name: str, run_idx: int) -> dict:
+        async with sem:
+            result = await run_ollama_query(
+                prompt=prompt,
+                model=model_name,
+                temperature=temperature,
+                base_url=base_url,
+                api_key=api_key,
+            )
+            result["model_name"] = model_name
+            result["run_number"] = run_idx
+            return result
+
+    classifier_results = await asyncio.gather(*[
+        _call_classifier(model, idx) for idx, model in enumerate(classifier_models)
+    ], return_exceptions=True)
+
+    # Filter out exceptions, keep successes
+    valid_results = [r for r in classifier_results if isinstance(r, dict)]
+    if not valid_results:
+        raise RuntimeError("All classifier models failed")
+
+    # Store individual classifier results
+    now = now_iso()
+    async with get_db() as db:
+        for r in valid_results:
             await db.execute(
                 """INSERT OR IGNORE INTO llm_results
-                   (smell_commit_id, prompt_pattern_id, run_number, primary_activity,
-                    sub_activity, reasoning, raw_response, input_tokens, output_tokens, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (sc["id"], pattern["id"], run_num,
-                 result["primary_activity"], result["sub_activity"], result["reasoning"],
-                 result["raw_response"], result["input_tokens"], result["output_tokens"],
-                 now_iso()),
+                   (smell_commit_id, prompt_pattern_id, run_number, model_name,
+                    primary_activity, sub_activity, reasoning, raw_response,
+                    input_tokens, output_tokens, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (sc_id, pattern_id, r["run_number"], r["model_name"],
+                 r["primary_activity"], r["sub_activity"], r["reasoning"],
+                 r["raw_response"], r["input_tokens"], r["output_tokens"], now),
             )
-            await db.commit()
+        await db.commit()
+
+    # Run aggregator (separate semaphore to avoid starvation behind classifiers)
+    async with agg_sem:
+        agg = await run_aggregator(
+            smell_data=sc,
+            responses=valid_results,
+            model=aggregator_model,
+            temperature=temperature,
+            base_url=base_url,
+            api_key=api_key,
+        )
+
+    # Store aggregated result (run_number=99 marks it as aggregated)
+    async with get_db() as db:
+        await db.execute(
+            """INSERT OR REPLACE INTO llm_results
+               (smell_commit_id, prompt_pattern_id, run_number, model_name,
+                primary_activity, sub_activity, reasoning, raw_response,
+                input_tokens, output_tokens, created_at)
+               VALUES (?,?,99,?,?,?,?,?,?,?,?)""",
+            (sc_id, pattern_id, aggregator_model,
+             agg["primary_activity"], agg["sub_activity"], agg["reasoning"],
+             agg["raw_response"], agg["input_tokens"], agg["output_tokens"], now_iso()),
+        )
+        # Store aggregated result in vote_results for results display
+        _vote_counts = dict(Counter(
+            r.get("primary_activity") for r in valid_results if r.get("primary_activity")
+        ))
+        _top_count = _vote_counts.get(agg["primary_activity"], 0)
+        await db.execute(
+            """INSERT OR REPLACE INTO vote_results
+               (smell_commit_id, prompt_pattern_id, primary_activity,
+                vote_count, total_votes, tied, tied_activities, all_votes, created_at)
+               VALUES (?,?,?,?,?,0,'[]',?,?)""",
+            (sc_id, pattern_id, agg["primary_activity"],
+             _top_count, len(valid_results),
+             json.dumps(_vote_counts),
+             now_iso()),
+        )
+        await db.commit()

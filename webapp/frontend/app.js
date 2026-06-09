@@ -104,13 +104,118 @@ async function route() {
 window.addEventListener('hashchange', route);
 window.addEventListener('load', route);
 
+// ─── Dataset Stats Tab ────────────────────────────────────────────────────────
+
+function renderDatasetTab() {
+  return `
+    <div class="max-w-5xl">
+      <h3 class="font-semibold text-lg mb-4">Dataset Statistics</h3>
+      <div id="dataset-content" class="text-center text-gray-400 py-12">Loading…</div>
+    </div>`;
+}
+
+async function loadDatasetStats() {
+  const dc = el('dataset-content');
+  if (!dc) return;
+  dc.innerHTML = '<div class="text-center text-gray-400 py-12">Loading…</div>';
+  try {
+    const data = await API.get(`/api/sessions/${state.session.id}/dataset-stats`);
+    renderDatasetContent(data);
+  } catch(e) {
+    dc.innerHTML = `<div class="text-red-400 py-8 text-sm">Error loading stats: ${escHtml(e.message)}
+      <button onclick="loadDatasetStats()" class="ml-3 border px-3 py-1 rounded text-sm text-gray-600 hover:bg-gray-50">↺ Retry</button>
+    </div>`;
+  }
+}
+
+function _statRow(label, val) {
+  if (val === null || val === undefined) return '';
+  return `<div class="flex justify-between text-sm py-1 border-b last:border-0">
+    <span class="text-gray-500">${label}</span>
+    <span class="font-mono font-medium">${typeof val === 'number' ? val.toLocaleString() : val}</span>
+  </div>`;
+}
+
+function _statsCard(title, s) {
+  if (!s || !s.count) return `
+    <div class="bg-white rounded-xl border shadow-sm p-5">
+      <div class="text-sm font-semibold text-gray-700 mb-3">${title}</div>
+      <div class="text-gray-400 text-sm">No data</div>
+    </div>`;
+  return `
+    <div class="bg-white rounded-xl border shadow-sm p-5">
+      <div class="text-sm font-semibold text-gray-700 mb-3">${title}</div>
+      <div class="space-y-0">
+        ${_statRow('Count', s.count)}
+        ${_statRow('Min', s.min)}
+        ${_statRow('Max', s.max)}
+        ${_statRow('Mean', s.mean)}
+        ${_statRow('Median', s.median)}
+        ${_statRow('Std Dev', s.std)}
+      </div>
+    </div>`;
+}
+
+function renderDatasetContent(data) {
+  const dc = el('dataset-content');
+  if (!dc) return;
+
+  if (data.total_repos === 0) {
+    dc.innerHTML = '<div class="text-gray-400 text-sm">No repositories loaded in this session.</div>';
+    return;
+  }
+
+  const errorsHtml = data.errors?.length ? `
+    <div class="mt-3 text-xs text-yellow-600 bg-yellow-50 border border-yellow-200 rounded-lg p-3">
+      ${data.errors.length} repo failed GitHub fetch: ${data.errors.map(r => `<code class="bg-yellow-100 px-1 rounded">${r}</code>`).join(', ')}
+    </div>` : '';
+
+  dc.innerHTML = `
+    <!-- Overview KPI -->
+    <div class="grid grid-cols-2 gap-4 mb-6">
+      <div class="bg-white rounded-xl border shadow-sm p-5">
+        <div class="text-xs text-gray-500 uppercase tracking-wide font-medium mb-2">Repositories in Session</div>
+        <div class="text-4xl font-bold text-gray-800">${data.total_repos.toLocaleString()}</div>
+      </div>
+      <div class="bg-white rounded-xl border shadow-sm p-5">
+        <div class="text-xs text-gray-500 uppercase tracking-wide font-medium mb-2">Fetched from GitHub</div>
+        <div class="text-4xl font-bold text-gray-800">${data.fetched.toLocaleString()}</div>
+        ${data.errors?.length ? `<div class="text-xs text-yellow-600 mt-1">${data.errors.length} failed</div>` : ''}
+      </div>
+    </div>
+
+    <!-- Numeric stats grid -->
+    <div class="grid grid-cols-3 gap-4 mb-4">
+      ${_statsCard('⭐ Stars', data.stars)}
+      ${_statsCard('🍴 Forks', data.forks)}
+      ${_statsCard('🐛 Open Issues', data.open_issues)}
+    </div>
+    <div class="grid grid-cols-2 gap-4">
+      ${_statsCard('💾 Size (KB)', data.size_kb)}
+      ${_statsCard('📄 Lines of Code (local clone)', data.lines_of_code)}
+    </div>
+
+    ${errorsHtml}
+    <p class="text-xs text-gray-400 mt-4">Stats fetched from GitHub API. LoC counted from local clones (only repos already scanned).</p>
+  `;
+}
+
 // ─── Sessions List ────────────────────────────────────────────────────────────
 
 async function renderSessions() {
   stopSSE();
   state.session = null;
-  state.sessions = await API.get('/api/sessions');
-  state.presets = await API.get('/api/preset-templates');
+  el('app').innerHTML = `<div class="max-w-5xl mx-auto p-6 py-16 text-center text-gray-400 text-sm">Loading…</div>`;
+  try {
+    state.sessions = await API.get('/api/sessions');
+    state.presets = await API.get('/api/preset-templates');
+  } catch(e) {
+    el('app').innerHTML = `<div class="max-w-5xl mx-auto p-6 py-16 text-center">
+      <div class="text-red-500 font-medium mb-3">Failed to load: ${escHtml(e.message)}</div>
+      <button onclick="route()" class="border px-4 py-2 rounded-lg text-sm hover:bg-gray-50">↺ Retry</button>
+    </div>`;
+    return;
+  }
 
   el('app').innerHTML = `
     <div class="max-w-5xl mx-auto p-6">
@@ -126,26 +231,31 @@ async function renderSessions() {
 
       <div id="create-form" class="hidden mb-6 bg-white rounded-xl border p-5 shadow-sm">
         <h2 class="font-semibold text-lg mb-4">Create Session</h2>
-        <div class="grid grid-cols-2 gap-4">
-          <div class="col-span-2"><label class="text-sm font-medium">Session Name *</label>
+        <div class="space-y-3">
+          <div><label class="text-sm font-medium">Session Name *</label>
             <input id="new-name" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" placeholder="e.g. Experiment 1 - Few-shot vs Zero-shot" /></div>
-          <div><label class="text-sm font-medium">OpenAI API Key</label>
-            <input id="new-key" type="password" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="sk-..." /></div>
-          <div><label class="text-sm font-medium">GitHub Token</label>
-            <input id="new-gh" type="password" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="ghp_..." /></div>
-          <div><label class="text-sm font-medium">Model</label>
-            <select id="new-model" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm">
-              <option value="gpt-4o-mini">gpt-4o-mini (recommended)</option>
-              <option value="gpt-4o">gpt-4o</option>
-              <option value="gpt-4-turbo">gpt-4-turbo</option>
-              <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
-            </select></div>
-          <div><label class="text-sm font-medium">Temperature</label>
-            <input id="new-temp" type="number" min="0" max="2" step="0.1" value="0" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" /></div>
-          <div><label class="text-sm font-medium">Runs per commit</label>
-            <input id="new-runs" type="number" min="1" max="20" value="10" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" /></div>
-          <div><label class="text-sm font-medium">Max parallel LLM calls</label>
-            <input id="new-parallel" type="number" min="1" max="100" value="20" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" /></div>
+          <div class="grid grid-cols-2 gap-3">
+            <div><label class="text-sm font-medium">LLM Base URL</label>
+              <input id="new-ollama-url" value="https://api.groq.com/openai" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+            <div><label class="text-sm font-medium">API Key <span class="text-gray-400">(Groq/OpenAI, blank = Ollama)</span></label>
+              <input id="new-llm-key" type="password" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="gsk_..." /></div>
+          </div>
+          <div class="grid grid-cols-3 gap-2">
+            <div><label class="text-sm font-medium">Classifier 1</label>
+              <input id="new-cls-0" value="llama-3.1-8b-instant" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+            <div><label class="text-sm font-medium">Classifier 2</label>
+              <input id="new-cls-1" value="gemma2-9b-it" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+            <div><label class="text-sm font-medium">Classifier 3</label>
+              <input id="new-cls-2" value="mixtral-8x7b-32768" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+          </div>
+          <div><label class="text-sm font-medium">Aggregator Model</label>
+            <input id="new-agg" value="llama-3.3-70b-versatile" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+          <div class="grid grid-cols-2 gap-3">
+            <div><label class="text-sm font-medium">GitHub Token</label>
+              <input id="new-gh" type="password" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="ghp_..." /></div>
+            <div><label class="text-sm font-medium">Temperature</label>
+              <input id="new-temp" type="number" min="0" max="2" step="0.1" value="0" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" /></div>
+          </div>
         </div>
         <div class="flex gap-3 mt-4">
           <button onclick="createSession()" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 text-sm font-medium">Create</button>
@@ -177,7 +287,7 @@ async function renderSessions() {
                   <td class="px-4 py-3">${badge(s.status)}</td>
                   <td class="px-4 py-3">${badge(s.phase1_status)} <span class="text-xs text-gray-400">${s.phase1_done}/${s.phase1_total}</span></td>
                   <td class="px-4 py-3">${badge(s.phase2_status)} <span class="text-xs text-gray-400">${s.phase2_done}/${s.phase2_total}</span></td>
-                  <td class="px-4 py-3 font-mono text-xs text-gray-600">${s.model}</td>
+                  <td class="px-4 py-3 font-mono text-xs text-gray-600">${s.aggregator_model || s.model || '—'}</td>
                   <td class="px-4 py-3 text-gray-400 text-xs">${new Date(s.created_at).toLocaleDateString()}</td>
                   <td class="px-4 py-3"><button onclick="event.stopPropagation();deleteSession(${s.id})"
                     class="text-red-400 hover:text-red-600 text-xs px-2 py-1 rounded hover:bg-red-50">Delete</button></td>
@@ -196,12 +306,12 @@ async function createSession() {
   if (!name) { alert('Session name required'); return; }
   const s = await API.post('/api/sessions', {
     name,
-    openai_api_key: el('new-key').value.trim() || null,
+    ollama_base_url: el('new-ollama-url').value.trim() || 'https://api.groq.com/openai',
+    llm_api_key: el('new-llm-key').value.trim() || null,
+    classifier_models: [0,1,2].map(i => el(`new-cls-${i}`)?.value.trim()).filter(Boolean),
+    aggregator_model: el('new-agg').value.trim() || 'llama-3.3-70b-versatile',
     github_token: el('new-gh').value.trim() || null,
-    model: el('new-model').value,
     temperature: parseFloat(el('new-temp').value),
-    n_runs: parseInt(el('new-runs').value),
-    max_parallel_llm: parseInt(el('new-parallel').value),
   });
   location.hash = `#/session/${s.id}`;
 }
@@ -216,20 +326,29 @@ async function deleteSession(id) {
 
 async function loadSession(id) {
   stopSSE();
-  state.session = await API.get(`/api/sessions/${id}`);
-  state.repos = await API.get(`/api/sessions/${id}/repos`);
-  state.patterns = await API.get(`/api/sessions/${id}/patterns`);
-  state.tab = 'config';
-  renderSessionPage();
-  startSSE(id);
+  el('app').innerHTML = `<div class="max-w-6xl mx-auto px-6 py-16 text-center text-gray-400 text-sm">Loading session…</div>`;
+  try {
+    state.session = await API.get(`/api/sessions/${id}`);
+    state.repos = await API.get(`/api/sessions/${id}/repos`);
+    state.patterns = await API.get(`/api/sessions/${id}/patterns`);
+    state.tab = 'config';
+    renderSessionPage();
+    startSSE(id);
+  } catch(e) {
+    el('app').innerHTML = `<div class="max-w-6xl mx-auto px-6 py-16 text-center">
+      <div class="text-red-500 font-medium mb-3">Failed to load session: ${escHtml(e.message)}</div>
+      <button onclick="route()" class="border px-4 py-2 rounded-lg text-sm hover:bg-gray-50 mr-2">↺ Retry</button>
+      <a href="#/" class="border px-4 py-2 rounded-lg text-sm hover:bg-gray-50">← Back to sessions</a>
+    </div>`;
+  }
 }
 
 function renderSessionPage() {
   const s = state.session;
   if (!s) return;
 
-  const tabs = ['config', 'repos', 'patterns', 'data', 'run', 'results'];
-  const tabLabels = { config: 'Config', repos: 'Repositories', patterns: 'Prompt Patterns', data: 'Data', run: 'Run', results: 'Results' };
+  const tabs = ['config', 'repos', 'patterns', 'data', 'run', 'results', 'dataset'];
+  const tabLabels = { config: 'Config', repos: 'Repositories', patterns: 'Prompt Patterns', data: 'Data', run: 'Run', results: 'Results', dataset: 'Dataset Stats' };
 
   el('app').innerHTML = `
     <div class="min-h-screen">
@@ -273,7 +392,7 @@ function renderSessionPage() {
 function switchTab(tab) {
   state.tab = tab;
   // Update tab styles
-  ['config','repos','patterns','data','run','results'].forEach(t => {
+  ['config','repos','patterns','data','run','results','dataset'].forEach(t => {
     const btn = el(`tab-${t}`);
     if (!btn) return;
     if (t === tab) {
@@ -294,6 +413,7 @@ function renderTab(tab) {
     case 'data':     return renderData();
     case 'run':      return renderRun();
     case 'results':  return renderResults();
+    case 'dataset':  return renderDatasetTab();
     default: return '';
   }
 }
@@ -302,37 +422,76 @@ function renderTab(tab) {
 
 function renderConfig() {
   const s = state.session;
+  const classifiers = (() => {
+    try { return JSON.parse(s.classifier_models || '[]'); } catch { return ["gemma3:12b","qwen2.5:7b","mistral:7b"]; }
+  })();
+  while (classifiers.length < 3) classifiers.push('');
+
   return `
     <div class="max-w-2xl">
       <h3 class="font-semibold text-lg mb-4">Session Configuration</h3>
-      <div class="bg-white rounded-xl border shadow-sm p-5 space-y-4">
+      <div class="bg-white rounded-xl border shadow-sm p-5 space-y-5">
+
         <div>
           <label class="text-sm font-medium text-gray-700">Session Name</label>
           <input id="cfg-name" value="${s.name}" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" />
         </div>
 
+        <!-- LLM Provider -->
+        <div>
+          <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">LLM Provider</div>
+          <div class="space-y-3">
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="text-sm font-medium text-gray-700">Base URL</label>
+                <div class="flex gap-2 mt-1">
+                  <input id="cfg-ollama-url" value="${s.ollama_base_url || 'https://api.groq.com/openai'}"
+                    class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" />
+                  <button onclick="loadOllamaModels()" class="border px-3 py-2 rounded-lg text-sm hover:bg-gray-50 whitespace-nowrap">
+                    ↻ List
+                  </button>
+                </div>
+              </div>
+              <div>
+                <label class="text-sm font-medium text-gray-700">API Key <span class="text-gray-400">(blank = Ollama)</span></label>
+                <input id="cfg-llm-key" type="password" value="${s.llm_api_key || ''}"
+                  class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="gsk_... / sk-..." />
+              </div>
+            </div>
+            <div id="ollama-models-hint" class="text-xs text-gray-400"></div>
+          </div>
+        </div>
+
+        <!-- Classifier Models -->
+        <div>
+          <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Classifier Models <span class="text-gray-400 font-normal normal-case">(3 models, each classifies independently)</span></div>
+          <div class="space-y-2">
+            ${[0,1,2].map(i => `
+              <div class="flex items-center gap-2">
+                <span class="text-xs text-gray-400 w-16">Model ${i+1}</span>
+                <input id="cfg-cls-${i}" value="${classifiers[i] || ''}"
+                  class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" placeholder="e.g. gemma3:12b" />
+              </div>`).join('')}
+          </div>
+        </div>
+
+        <!-- Aggregator -->
+        <div>
+          <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Aggregator Model <span class="text-gray-400 font-normal normal-case">(synthesizes the 3 responses)</span></div>
+          <input id="cfg-agg" value="${s.aggregator_model || 'llama3.1:8b'}"
+            class="w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="e.g. llama3.1:8b" />
+        </div>
+
+        <!-- Other settings -->
         <div class="grid grid-cols-2 gap-4">
           <div>
-            <label class="text-sm font-medium text-gray-700">LLM Model</label>
-            <select id="cfg-model" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm">
-              ${['gpt-4o-mini','gpt-4o','gpt-4-turbo','gpt-3.5-turbo'].map(m =>
-                `<option value="${m}" ${s.model === m ? 'selected' : ''}>${m}</option>`
-              ).join('')}
-            </select>
-          </div>
-          <div>
-            <label class="text-sm font-medium text-gray-700">Temperature <span class="text-gray-400">(0 = deterministic)</span></label>
+            <label class="text-sm font-medium text-gray-700">Temperature</label>
             <input id="cfg-temp" type="number" min="0" max="2" step="0.1" value="${s.temperature}"
               class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" />
           </div>
           <div>
-            <label class="text-sm font-medium text-gray-700">Runs per commit <span class="text-gray-400">(for majority vote)</span></label>
-            <input id="cfg-runs" type="number" min="1" max="20" value="${s.n_runs}"
-              class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" />
-          </div>
-          <div>
-            <label class="text-sm font-medium text-gray-700">Max parallel LLM calls</label>
-            <input id="cfg-parallel" type="number" min="1" max="100" value="${s.max_parallel_llm}"
+            <label class="text-sm font-medium text-gray-700">Max parallel smell tasks</label>
+            <input id="cfg-parallel" type="number" min="1" max="20" value="${s.max_parallel_llm || 6}"
               class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" />
           </div>
           <div>
@@ -348,12 +507,7 @@ function renderConfig() {
         </div>
 
         <div>
-          <label class="text-sm font-medium text-gray-700">OpenAI API Key</label>
-          <input id="cfg-key" type="password" value="${s.openai_api_key || ''}"
-            class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="sk-..." />
-        </div>
-        <div>
-          <label class="text-sm font-medium text-gray-700">GitHub Token <span class="text-gray-400">(for private repos & higher rate limits)</span></label>
+          <label class="text-sm font-medium text-gray-700">GitHub Token <span class="text-gray-400">(private repos & higher rate limits)</span></label>
           <input id="cfg-gh" type="password" value="${s.github_token || ''}"
             class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="ghp_..." />
         </div>
@@ -366,23 +520,47 @@ function renderConfig() {
     </div>`;
 }
 
+async function loadOllamaModels() {
+  const baseUrl = el('cfg-ollama-url')?.value || 'http://localhost:11434';
+  const hint = el('ollama-models-hint');
+  if (hint) hint.textContent = 'Loading…';
+  try {
+    const data = await API.get(`/api/ollama/models?base_url=${encodeURIComponent(baseUrl)}`);
+    if (data.models?.length) {
+      if (hint) hint.innerHTML = `Available: ${data.models.map(m => `<code class="bg-gray-100 px-1 rounded">${m}</code>`).join(' ')}`;
+    } else {
+      if (hint) hint.textContent = data.error || 'No models found';
+    }
+  } catch(e) {
+    if (hint) hint.textContent = 'Error: ' + e.message;
+  }
+}
+
 async function saveConfig() {
   const s = state.session;
-  const updated = await API.put(`/api/sessions/${s.id}`, {
-    name: el('cfg-name').value.trim(),
-    model: el('cfg-model').value,
-    temperature: parseFloat(el('cfg-temp').value),
-    n_runs: parseInt(el('cfg-runs').value),
-    max_parallel_llm: parseInt(el('cfg-parallel').value),
-    branch: el('cfg-branch').value.trim(),
-    max_commits: el('cfg-maxcommits').value ? parseInt(el('cfg-maxcommits').value) : null,
-    openai_api_key: el('cfg-key').value.trim() || null,
-    github_token: el('cfg-gh').value.trim() || null,
-  });
-  state.session = updated;
-  el('cfg-saved').classList.remove('hidden');
-  setTimeout(() => el('cfg-saved')?.classList.add('hidden'), 2000);
-  addLog('Config saved', 'success');
+  const classifiers = [0,1,2].map(i => el(`cfg-cls-${i}`)?.value.trim()).filter(Boolean);
+  try {
+    const updated = await API.put(`/api/sessions/${s.id}`, {
+      name: el('cfg-name').value.trim(),
+      classifier_models: classifiers,
+      aggregator_model: el('cfg-agg').value.trim(),
+      ollama_base_url: el('cfg-ollama-url').value.trim(),
+      llm_api_key: el('cfg-llm-key').value.trim() || null,
+      temperature: parseFloat(el('cfg-temp').value),
+      max_parallel_llm: parseInt(el('cfg-parallel').value),
+      branch: el('cfg-branch').value.trim(),
+      max_commits: el('cfg-maxcommits').value ? parseInt(el('cfg-maxcommits').value) : null,
+      github_token: el('cfg-gh').value.trim() || null,
+    });
+    state.session = updated;
+    const saved = el('cfg-saved');
+    if (saved) { saved.textContent = '✓ Saved'; saved.className = 'text-green-600 text-sm self-center'; saved.classList.remove('hidden'); setTimeout(() => saved?.classList.add('hidden'), 2000); }
+    addLog('Config saved', 'success');
+  } catch(e) {
+    const saved = el('cfg-saved');
+    if (saved) { saved.textContent = '✗ ' + e.message; saved.className = 'text-red-500 text-sm self-center'; saved.classList.remove('hidden'); setTimeout(() => saved?.classList.add('hidden'), 4000); }
+    addLog('Config save failed: ' + escHtml(e.message), 'error');
+  }
 }
 
 // ─── Tab: Repos ───────────────────────────────────────────────────────────────
@@ -877,7 +1055,7 @@ function renderRun() {
           <div>
             <h4 class="font-semibold">Phase 2: LLM Classification</h4>
             <p class="text-xs text-gray-400 mt-0.5">
-              ${s.n_runs} runs × ${state.patterns.filter(p => p.enabled !== false && p.enabled !== 0).length} patterns in parallel • majority voting
+              3 classifiers → aggregator • ${state.patterns.filter(p => p.enabled !== false && p.enabled !== 0).length} pattern(s) enabled
             </p>
           </div>
           <div class="flex items-center gap-2">
@@ -1046,12 +1224,20 @@ function renderResults() {
 }
 
 async function refreshResults() {
-  const repoId = el('results-repo-filter')?.value || '';
-  const url = `/api/sessions/${state.session.id}/results/charts${repoId ? '?repo_id=' + repoId : ''}`;
-  const summaryUrl = `/api/sessions/${state.session.id}/results/summary`;
-  const [charts, summary] = await Promise.all([API.get(url), API.get(summaryUrl)]);
-  state.results = { charts, summary };
-  renderResultsContent(charts, summary);
+  const rc = el('results-content');
+  if (rc) rc.innerHTML = '<div class="text-center text-gray-400 py-8">Loading results…</div>';
+  try {
+    const repoId = el('results-repo-filter')?.value || '';
+    const url = `/api/sessions/${state.session.id}/results/charts${repoId ? '?repo_id=' + repoId : ''}`;
+    const summaryUrl = `/api/sessions/${state.session.id}/results/summary`;
+    const [charts, summary] = await Promise.all([API.get(url), API.get(summaryUrl)]);
+    state.results = { charts, summary };
+    renderResultsContent(charts, summary);
+  } catch(e) {
+    if (rc) rc.innerHTML = `<div class="text-red-400 py-8 text-sm">Error loading results: ${escHtml(e.message)}
+      <button onclick="refreshResults()" class="ml-3 border px-3 py-1 rounded text-sm text-gray-600 hover:bg-gray-50">↺ Retry</button>
+    </div>`;
+  }
 }
 
 function _chartCard(id, title, subtitle, downloadId) {
@@ -1372,7 +1558,7 @@ function startSSE(sessionId) {
 
   state.es.onerror = () => {
     addLog('SSE connection lost, reconnecting...', 'warn');
-    setTimeout(() => startSSE(sessionId), 3000);
+    setTimeout(() => { if (state.session?.id === sessionId) startSSE(sessionId); }, 3000);
   };
 }
 
@@ -1499,6 +1685,8 @@ window.switchTab = async function(tab) {
   origSwitchTab(tab);
   if (tab === 'results') {
     await refreshResults();
+  } else if (tab === 'dataset') {
+    await loadDatasetStats();
   }
 };
 
@@ -1532,3 +1720,7 @@ window.backfillDates = backfillDates;
 window.importReposCSV = importReposCSV;
 window.importLocalPath = importLocalPath;
 window.clearAllRepos = clearAllRepos;
+window.loadOllamaModels = loadOllamaModels;
+window.loadDatasetStats = loadDatasetStats;
+window.refreshResults = refreshResults;
+window.route = route;

@@ -1,10 +1,14 @@
+import asyncio
 import csv
 import io
 import json
+import math
+import statistics
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -43,11 +47,12 @@ app.add_middleware(
 
 class SessionCreate(BaseModel):
     name: str
-    model: str = "gpt-4o-mini"
+    classifier_models: list[str] = ["llama-3.1-8b-instant", "gemma2-9b-it", "mixtral-8x7b-32768"]
+    aggregator_model: str = "llama-3.3-70b-versatile"
+    ollama_base_url: str = "https://api.groq.com/openai"
+    llm_api_key: Optional[str] = None
     temperature: float = 0.0
-    n_runs: int = 10
-    max_parallel_llm: int = 20
-    openai_api_key: Optional[str] = None
+    max_parallel_llm: int = 3
     github_token: Optional[str] = None
     branch: str = "main"
     max_commits: Optional[int] = None
@@ -55,11 +60,12 @@ class SessionCreate(BaseModel):
 
 class SessionUpdate(BaseModel):
     name: Optional[str] = None
-    model: Optional[str] = None
+    classifier_models: Optional[list[str]] = None
+    aggregator_model: Optional[str] = None
+    ollama_base_url: Optional[str] = None
+    llm_api_key: Optional[str] = None
     temperature: Optional[float] = None
-    n_runs: Optional[int] = None
     max_parallel_llm: Optional[int] = None
-    openai_api_key: Optional[str] = None
     github_token: Optional[str] = None
     branch: Optional[str] = None
     max_commits: Optional[int] = None
@@ -92,13 +98,20 @@ async def list_sessions():
 @app.post("/api/sessions", status_code=201)
 async def create_session(body: SessionCreate):
     async with get_db() as db:
+        import json as _json
         cur = await db.execute(
             """INSERT INTO sessions
-               (name, model, temperature, n_runs, max_parallel_llm,
-                openai_api_key, github_token, branch, max_commits, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (body.name, body.model, body.temperature, body.n_runs, body.max_parallel_llm,
-             body.openai_api_key, body.github_token, body.branch, body.max_commits,
+               (name, classifier_models, aggregator_model, ollama_base_url,
+                llm_api_key, temperature, max_parallel_llm, github_token, branch, max_commits,
+                created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (body.name,
+             _json.dumps(body.classifier_models),
+             body.aggregator_model,
+             body.ollama_base_url,
+             body.llm_api_key,
+             body.temperature, body.max_parallel_llm,
+             body.github_token, body.branch, body.max_commits,
              now_iso(), now_iso()),
         )
         session_id = cur.lastrowid
@@ -129,9 +142,13 @@ async def update_session(sid: int, body: SessionUpdate):
         row = await (await db.execute("SELECT * FROM sessions WHERE id=?", (sid,))).fetchone()
         if not row:
             raise HTTPException(404)
+        import json as _json
         updates = {k: v for k, v in body.model_dump().items() if v is not None}
         if not updates:
             return dict(row)
+        # Serialize list fields to JSON string
+        if "classifier_models" in updates and isinstance(updates["classifier_models"], list):
+            updates["classifier_models"] = _json.dumps(updates["classifier_models"])
         set_clause = ", ".join(f"{k}=?" for k in updates)
         await db.execute(
             f"UPDATE sessions SET {set_clause}, updated_at=? WHERE id=?",
@@ -524,8 +541,8 @@ async def start_p2(sid: int):
             raise HTTPException(404)
         if is_running(sid):
             return {"status": "already_running"}
-        if not row["openai_api_key"]:
-            raise HTTPException(400, "OpenAI API key required")
+        if not row["ollama_base_url"]:
+            raise HTTPException(400, "Ollama base URL required")
         # Reset stuck 'running' smell_commits to 'pending'
         await db.execute(
             "UPDATE smell_commits SET status='pending', updated_at=? WHERE session_id=? AND status='running'",
@@ -884,6 +901,117 @@ async def session_events(sid: int):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ─── Ollama Models ────────────────────────────────────────────────────────────
+
+
+@app.get("/api/ollama/models")
+async def list_ollama_models(base_url: str = "http://localhost:11434"):
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{base_url.rstrip('/')}/api/tags")
+            if r.status_code == 200:
+                data = r.json()
+                return {"models": [m["name"] for m in data.get("models", [])]}
+    except Exception:
+        pass
+    return {"models": [], "error": "Ollama not reachable"}
+
+
+# ─── Dataset Stats ────────────────────────────────────────────────────────────
+
+REPOS_DIR = Path(__file__).parent.parent / "data" / "repos"
+
+
+def _num_stats(values: list[float]) -> dict:
+    if not values:
+        return {}
+    return {
+        "count": len(values),
+        "min": round(min(values), 2),
+        "max": round(max(values), 2),
+        "mean": round(statistics.mean(values), 2),
+        "median": round(statistics.median(values), 2),
+        "std": round(statistics.stdev(values) if len(values) > 1 else 0.0, 2),
+    }
+
+
+def _count_loc(owner: str, name: str) -> int | None:
+    """Count non-blank Python lines in local clone."""
+    local = REPOS_DIR / f"{owner}_{name}"
+    if not local.exists():
+        return None
+    total = 0
+    for f in local.rglob("*.py"):
+        try:
+            lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
+            total += sum(1 for l in lines if l.strip())
+        except OSError:
+            pass
+    return total if total > 0 else None
+
+
+async def _fetch_github_repo(client: httpx.AsyncClient, owner: str, name: str, token: str | None) -> dict | None:
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        r = await client.get(f"https://api.github.com/repos/{owner}/{name}", headers=headers, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+@app.get("/api/sessions/{sid}/dataset-stats")
+async def session_dataset_stats(sid: int):
+    async with get_db() as db:
+        session_row = await db.execute_fetchone("SELECT github_token FROM sessions WHERE id = ?", (sid,))
+        repo_rows = await db.execute_fetchall(
+            "SELECT owner, name FROM repositories WHERE session_id = ?", (sid,)
+        )
+    if not repo_rows:
+        return {"total_repos": 0, "stars": {}, "forks": {}, "open_issues": {}, "size_kb": {}, "lines_of_code": {}}
+
+    token = session_row["github_token"] if session_row else None
+
+    semaphore = asyncio.Semaphore(10)
+
+    async def fetch_with_sem(owner, name):
+        async with semaphore:
+            return owner, name, await _fetch_github_repo(client, owner, name, token)
+
+    async with httpx.AsyncClient() as client:
+        tasks = [fetch_with_sem(r["owner"], r["name"]) for r in repo_rows]
+        results = await asyncio.gather(*tasks)
+
+    stars, forks, issues, size_kb, loc = [], [], [], [], []
+    errors = []
+
+    for owner, name, gh in results:
+        if gh is None:
+            errors.append(f"{owner}/{name}")
+            continue
+        stars.append(float(gh.get("stargazers_count", 0)))
+        forks.append(float(gh.get("forks_count", 0)))
+        issues.append(float(gh.get("open_issues_count", 0)))
+        size_kb.append(float(gh.get("size", 0)))
+        cloc = _count_loc(owner, name)
+        if cloc is not None:
+            loc.append(float(cloc))
+
+    return {
+        "total_repos": len(repo_rows),
+        "fetched": len(repo_rows) - len(errors),
+        "errors": errors,
+        "stars": _num_stats(stars),
+        "forks": _num_stats(forks),
+        "open_issues": _num_stats(issues),
+        "size_kb": _num_stats(size_kb),
+        "lines_of_code": _num_stats(loc),
+    }
 
 
 # ─── Static Files ─────────────────────────────────────────────────────────────

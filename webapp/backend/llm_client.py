@@ -3,7 +3,6 @@ import re
 import asyncio
 from openai import AsyncOpenAI
 from typing import Optional
-from collections import Counter
 
 ACTIVITIES = ["Feature Introduction", "Bug Fixing", "Enhancement", "Refactoring"]
 
@@ -136,7 +135,7 @@ PRESET_TEMPLATES = {
     "Role-Play": ROLE_PLAY_TEMPLATE,
 }
 
-# ─── LLM Client ───────────────────────────────────────────────────────────────
+# ─── Prompt Builder ───────────────────────────────────────────────────────────
 
 
 def build_prompt(template: str, task_data: dict) -> str:
@@ -154,14 +153,75 @@ def build_prompt(template: str, task_data: dict) -> str:
     )
 
 
-async def run_llm_query(
+def build_aggregator_prompt(smell_data: dict, responses: list[dict]) -> str:
+    smell_type = smell_data.get("smell_type", "Unknown")
+    commit_msg = smell_data.get("commit_message") or "[No commit message]"
+    diff_excerpt = (smell_data.get("diff_content") or "[No diff]")[:800]
+
+    model_blocks = ""
+    for i, r in enumerate(responses, 1):
+        model_blocks += f"""
+Model {i} ({r['model_name']}):
+  primary_activity: {r.get('primary_activity') or 'Unknown'}
+  sub_activity: {r.get('sub_activity') or '—'}
+  reasoning: {r.get('reasoning') or '—'}
+"""
+
+    return f"""\
+You are an expert software engineering researcher acting as a meta-classifier.
+
+Three independent AI models have analyzed the following ML code smell commit and produced their classifications. Your task is to synthesize their analyses into a single, well-reasoned final classification.
+
+**Smell Type:** {smell_type}
+**Commit Message:** {commit_msg}
+**Code Diff (excerpt):**
+```
+{diff_excerpt}
+```
+
+**Model Classifications:**
+{model_blocks}
+
+Based on all three analyses, provide your final authoritative classification. Weight the reasoning quality, not just the labels. If models disagree, explain why you chose one over the others.
+
+Choose exactly one primary activity:
+- Feature Introduction: Adding new ML functionality or components
+- Bug Fixing: Fixing a defect or incorrect behavior
+- Enhancement: Improving or optimizing existing functionality
+- Refactoring: Restructuring code without changing external behavior
+
+Respond in valid JSON only:
+{{"primary_activity": "<one of the four>", "sub_activity": "<specific sub-activity>", "reasoning": "<your synthesis of the three analyses>"}}"""
+
+
+# ─── Ollama / OpenAI-compatible Client ────────────────────────────────────────
+
+
+def _make_client(base_url: str, api_key: str = "ollama") -> AsyncOpenAI:
+    return AsyncOpenAI(
+        base_url=f"{base_url.rstrip('/')}/v1",
+        api_key=api_key,
+    )
+
+
+async def _sleep_for_ratelimit(e: Exception, attempt: int) -> None:
+    """Wait longer on 429 rate-limit errors (Groq / OpenAI), normal backoff otherwise."""
+    msg = str(e).lower()
+    if "429" in msg or "rate limit" in msg or "rate_limit" in msg:
+        await asyncio.sleep(60)
+    else:
+        await asyncio.sleep(2 ** attempt * 2)
+
+
+async def run_ollama_query(
     prompt: str,
     model: str,
     temperature: float,
-    api_key: str,
+    base_url: str = "http://localhost:11434",
+    api_key: str = "ollama",
     max_retries: int = 3,
 ) -> dict:
-    client = AsyncOpenAI(api_key=api_key)
+    client = _make_client(base_url, api_key)
 
     for attempt in range(max_retries):
         try:
@@ -169,7 +229,6 @@ async def run_llm_query(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
-                response_format={"type": "json_object"},
                 max_tokens=600,
             )
 
@@ -186,16 +245,101 @@ async def run_llm_query(
             }
 
         except Exception as e:
-            err = str(e).lower()
-            if "rate_limit" in err or "429" in err:
-                wait = 2 ** attempt * 10
-                await asyncio.sleep(wait)
-                if attempt == max_retries - 1:
-                    raise
-            elif attempt == max_retries - 1:
+            if attempt == max_retries - 1:
                 raise
+            await _sleep_for_ratelimit(e, attempt)
 
-    raise RuntimeError("LLM query failed after retries")
+    raise RuntimeError(f"LLM query failed after {max_retries} retries")
+
+
+async def run_aggregator(
+    smell_data: dict,
+    responses: list[dict],
+    model: str,
+    temperature: float,
+    base_url: str = "http://localhost:11434",
+    api_key: str = "ollama",
+    max_retries: int = 3,
+) -> dict:
+    prompt = build_aggregator_prompt(smell_data, responses)
+    client = _make_client(base_url, api_key)
+
+    for attempt in range(max_retries):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=800,
+            )
+
+            raw = response.choices[0].message.content or ""
+            parsed = _parse_json(raw)
+
+            return {
+                "primary_activity": _normalize_activity(parsed.get("primary_activity", "")),
+                "sub_activity": str(parsed.get("sub_activity", "")),
+                "reasoning": str(parsed.get("reasoning", "")),
+                "raw_response": raw,
+                "input_tokens": response.usage.prompt_tokens if response.usage else 0,
+                "output_tokens": response.usage.completion_tokens if response.usage else 0,
+            }
+
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            await _sleep_for_ratelimit(e, attempt)
+
+    raise RuntimeError(f"Aggregator query failed after {max_retries} retries")
+
+
+async def run_normalization_batch(
+    labels: list[str],
+    model: str,
+    base_url: str = "http://localhost:11434",
+    api_key: str = "ollama",
+    max_retries: int = 3,
+) -> dict[str, str]:
+    label_list = "\n".join(f"- {l}" for l in labels)
+    prompt = f"""You are a research assistant normalizing software engineering activity labels for a scientific study.
+
+Below is a list of sub-activity labels. Assign a single canonical label to each.
+
+Labels:
+{label_list}
+
+STRICT RULES (no exceptions):
+1. Canonical labels MUST be singular (never plural): "test case" not "test cases", "memory fix" not "memory fixes"
+2. Canonical labels MUST be lowercase, 2-4 words max
+3. Be VERY aggressive in merging: if two labels describe the same concept even with different wording, they get the same canonical
+4. Merge labels that differ only in: plural/singular, capitalization, article (a/the), specific class/file names ("for ReportGenerator" vs "for Inspector" → same canonical if both mean "adding test cases")
+5. Prefer the most generic version when merging specifics: "adding test cases for ReportGenerator" → "test case addition"
+6. Output every input label exactly once
+
+Respond in valid JSON only:
+{{"mappings": [{{"raw": "<original label>", "canonical": "<normalized label>"}}, ...]}}"""
+
+    client = _make_client(base_url, api_key)
+    for attempt in range(max_retries):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            raw = response.choices[0].message.content or ""
+            parsed = _parse_json(raw)
+            mappings = parsed.get("mappings", [])
+            return {m["raw"]: m["canonical"] for m in mappings if "raw" in m and "canonical" in m}
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            await _sleep_for_ratelimit(e, attempt)
+    return {}
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
 def _parse_json(raw: str) -> dict:
@@ -217,78 +361,3 @@ def _normalize_activity(value: str) -> Optional[str]:
         if act.lower() in val or val in act.lower():
             return act
     return None
-
-
-async def run_normalization_batch(
-    labels: list[str],
-    model: str,
-    api_key: str,
-    max_retries: int = 3,
-) -> dict[str, str]:
-    """Send a batch of raw sub_activity labels to LLM. Returns {raw: canonical}."""
-    label_list = "\n".join(f"- {l}" for l in labels)
-    prompt = f"""You are a research assistant normalizing software engineering activity labels for a scientific study.
-
-Below is a list of sub-activity labels. Assign a single canonical label to each.
-
-Labels:
-{label_list}
-
-STRICT RULES (no exceptions):
-1. Canonical labels MUST be singular (never plural): "test case" not "test cases", "memory fix" not "memory fixes"
-2. Canonical labels MUST be lowercase, 2-4 words max
-3. Be VERY aggressive in merging: if two labels describe the same concept even with different wording, they get the same canonical
-4. Merge labels that differ only in: plural/singular, capitalization, article (a/the), specific class/file names ("for ReportGenerator" vs "for Inspector" → same canonical if both mean "adding test cases")
-5. Prefer the most generic version when merging specifics: "adding test cases for ReportGenerator" → "test case addition"
-6. Output every input label exactly once
-
-Respond in valid JSON only:
-{{"mappings": [{{"raw": "<original label>", "canonical": "<normalized label>"}}, ...]}}"""
-
-    client = AsyncOpenAI(api_key=api_key)
-    for attempt in range(max_retries):
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-                max_tokens=4096,
-            )
-            raw = response.choices[0].message.content or ""
-            parsed = _parse_json(raw)
-            mappings = parsed.get("mappings", [])
-            return {m["raw"]: m["canonical"] for m in mappings if "raw" in m and "canonical" in m}
-        except Exception as e:
-            err = str(e).lower()
-            if ("rate_limit" in err or "429" in err) and attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt * 10)
-            elif attempt == max_retries - 1:
-                raise
-    return {}
-
-
-def compute_majority_vote(results: list[dict]) -> dict:
-    valid = [r["primary_activity"] for r in results if r.get("primary_activity")]
-    if not valid:
-        return {
-            "primary_activity": None,
-            "vote_count": 0,
-            "total_votes": len(results),
-            "tied": False,
-            "tied_activities": [],
-            "all_votes": {},
-        }
-
-    counts = Counter(valid)
-    max_count = max(counts.values())
-    winners = [act for act, cnt in counts.items() if cnt == max_count]
-
-    return {
-        "primary_activity": winners[0] if len(winners) == 1 else None,
-        "vote_count": max_count,
-        "total_votes": len(valid),
-        "tied": len(winners) > 1,
-        "tied_activities": winners if len(winners) > 1 else [],
-        "all_votes": dict(counts),
-    }
