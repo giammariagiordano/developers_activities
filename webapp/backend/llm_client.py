@@ -11,126 +11,181 @@ ACTIVITIES = ["Feature Introduction", "Bug Fixing", "Enhancement", "Refactoring"
 ZERO_SHOT_TEMPLATE = """\
 You are an expert software engineer specializing in ML systems and technical debt analysis.
 
-Analyze the following commit that introduced an ML-specific code smell into an ML-enabled system.
+Your task: classify the **developer's primary goal** when making a commit that incidentally introduced an ML-specific code smell. The smell itself is not the activity — focus on what the developer was trying to achieve.
 
 **Smell Type:** {smell_type}{smell_name_suffix}
 **Commit Message:** {commit_message}
-{issue_context}{pr_context}
-**Code Diff:**
+{issue_context}{pr_context}**Code Diff:**
 ```
 {diff}
 ```
 
-Classify the developer activity that introduced this ML-specific code smell.
 Choose exactly one primary activity:
-- Feature Introduction: Adding new ML functionality or components
-- Bug Fixing: Fixing a defect or incorrect behavior
-- Enhancement: Improving or optimizing existing functionality
-- Refactoring: Restructuring code without changing external behavior
+- **Feature Introduction** — developer was adding new ML functionality, models, or pipeline components (signals: new files, new classes, new integrations)
+- **Bug Fixing** — developer was correcting a defect, incorrect behavior, or failing test (signals: targeted line corrections, error handling, test fixes)
+- **Enhancement** — developer was improving performance, efficiency, or usability of existing functionality (signals: algorithmic changes, vectorization, config tuning)
+- **Refactoring** — developer was restructuring, renaming, or reorganizing code without changing behavior (signals: renames, moves, interface cleanup, no logic change)
 
-Respond in valid JSON only:
-{{"primary_activity": "<one of the four>", "sub_activity": "<e.g. performance optimization, new model integration>", "reasoning": "<1-2 sentence explanation>"}}"""
+If the commit message conflicts with the diff, prioritize the diff. If ambiguous between two categories, choose the one most directly supported by the diff structure.
+
+Respond in valid JSON only — no markdown, no text outside the JSON object:
+{{"primary_activity": "<one of the four>", "sub_activity": "<specific sub-activity, e.g. 'new model integration', 'memory optimization'>", "reasoning": "<1-2 sentences citing specific evidence from the commit message or diff>"}}"""
 
 
-FEW_SHOT_TEMPLATE = """\
+ONE_SHOT_TEMPLATE = """\
 You are an expert software engineer specializing in ML systems and technical debt analysis.
 
-Here are examples of how to classify developer activities that introduce ML-specific code smells:
+Your task: classify the **developer's primary goal** when making a commit that incidentally introduced an ML-specific code smell. The smell itself is not the activity — focus on what the developer was trying to achieve.
 
-EXAMPLE 1:
+Study this labeled example before classifying:
+
+---
+EXAMPLE:
 Smell: hyperparameters_not_explicitly_set
 Commit Message: "Add LSTM model for time series forecasting"
-Diff: +model = LSTM(hidden_size=128) +model.fit(X_train, y_train)
-Classification: {{"primary_activity": "Feature Introduction", "sub_activity": "new ML model integration", "reasoning": "Developer added a new LSTM model without explicitly setting all hyperparameters, typical of initial feature implementation."}}
+Diff:
++class LSTMForecaster:
++    def __init__(self):
++        self.model = LSTM(hidden_size=128)
++    def fit(self, X, y):
++        self.model.fit(X, y)
++pipeline.add_step(LSTMForecaster())
+Classification: {{"primary_activity": "Feature Introduction", "sub_activity": "new ML model integration", "reasoning": "Commit message explicitly states a new model is being added; the diff confirms new class definition and pipeline wiring with no pre-existing code modified — the missing hyperparameter defaults are incidental to the feature work."}}
+---
 
-EXAMPLE 2:
-Smell: gradients_not_cleared_before_backward_propagation
-Commit Message: "Fix gradient accumulation bug in training loop"
-Diff: -for batch in loader: -    loss.backward() +for batch in loader: +    optimizer.zero_grad() +    loss.backward()
-Classification: {{"primary_activity": "Bug Fixing", "sub_activity": "gradient management fix", "reasoning": "Developer was fixing incorrect gradient behavior, accidentally left out zero_grad in one path."}}
-
-EXAMPLE 3:
-Smell: unnecessary_iteration
-Commit Message: "Improve data preprocessing pipeline speed"
-Diff: -for i in range(len(df)): -    df.iloc[i] = transform(df.iloc[i]) +df = df.apply(transform)
-Classification: {{"primary_activity": "Enhancement", "sub_activity": "performance optimization", "reasoning": "Developer improved processing speed but introduced an iteration smell in an adjacent code path."}}
-
-EXAMPLE 4:
-Smell: memory_not_freed
-Commit Message: "Refactor model inference module for cleaner architecture"
-Diff: -class OldInference: -    def predict(self, x): ... +class ModelInference: +    def run(self, x): ...
-Classification: {{"primary_activity": "Refactoring", "sub_activity": "code reorganization", "reasoning": "Developer restructured the inference module without fixing existing memory management issues."}}
-
-Now classify the following:
+Now classify:
 
 **Smell Type:** {smell_type}{smell_name_suffix}
 **Commit Message:** {commit_message}
-{issue_context}{pr_context}
-**Code Diff:**
+{issue_context}{pr_context}**Code Diff:**
 ```
 {diff}
 ```
 
-Respond in valid JSON only:
-{{"primary_activity": "<one of the four>", "sub_activity": "<specific sub-activity>", "reasoning": "<1-2 sentence explanation>"}}"""
+Choose exactly one primary activity:
+- **Feature Introduction** — developer was adding new ML functionality, models, or pipeline components (signals: new files, new classes, new integrations)
+- **Bug Fixing** — developer was correcting a defect, incorrect behavior, or failing test (signals: targeted line corrections, error handling, test fixes)
+- **Enhancement** — developer was improving performance, efficiency, or usability of existing functionality (signals: algorithmic changes, vectorization, config tuning)
+- **Refactoring** — developer was restructuring, renaming, or reorganizing code without changing behavior (signals: renames, moves, interface cleanup, no logic change)
+
+If the commit message conflicts with the diff, prioritize the diff. If ambiguous between two categories, choose the one most directly supported by the diff structure.
+
+Respond in valid JSON only — no markdown, no text outside the JSON object:
+{{"primary_activity": "<one of the four>", "sub_activity": "<specific sub-activity>", "reasoning": "<1-2 sentences citing specific evidence from the commit message or diff>"}}"""
+
+
+TWO_SHOT_TEMPLATE = """\
+You are an expert software engineer specializing in ML systems and technical debt analysis.
+
+Your task: classify the **developer's primary goal** when making a commit that incidentally introduced an ML-specific code smell. The smell itself is not the activity — focus on what the developer was trying to achieve.
+
+Study these two labeled examples before classifying:
+
+---
+EXAMPLE 1:
+Smell: gradients_not_cleared_before_backward_propagation
+Commit Message: "Fix gradient accumulation bug in training loop"
+Diff:
+ for batch in loader:
+-    loss = criterion(output, target)
+-    loss.backward()
++    optimizer.zero_grad()
++    loss = criterion(output, target)
++    loss.backward()
+Classification: {{"primary_activity": "Bug Fixing", "sub_activity": "gradient management fix", "reasoning": "Commit message explicitly names a bug; the diff shows a targeted single-line insertion to correct a known defect pattern — the smell was introduced incidentally in an adjacent code path, not as the main goal."}}
+
+EXAMPLE 2:
+Smell: memory_not_freed
+Commit Message: "Refactor model inference module for cleaner architecture"
+Diff:
+-class OldInference:
+-    def predict(self, x):
+-        result = self.model(x)
+-        return result
++class ModelInference:
++    def run(self, x):
++        result = self.model(x)
++        return result
+Classification: {{"primary_activity": "Refactoring", "sub_activity": "code reorganization", "reasoning": "Commit message explicitly states 'refactor'; the diff shows pure rename and restructure with identical logic — the memory management smell pre-existed and was not introduced as part of a functional change."}}
+---
+
+Now classify:
+
+**Smell Type:** {smell_type}{smell_name_suffix}
+**Commit Message:** {commit_message}
+{issue_context}{pr_context}**Code Diff:**
+```
+{diff}
+```
+
+Choose exactly one primary activity:
+- **Feature Introduction** — developer was adding new ML functionality, models, or pipeline components (signals: new files, new classes, new integrations)
+- **Bug Fixing** — developer was correcting a defect, incorrect behavior, or failing test (signals: targeted line corrections, error handling, test fixes)
+- **Enhancement** — developer was improving performance, efficiency, or usability of existing functionality (signals: algorithmic changes, vectorization, config tuning)
+- **Refactoring** — developer was restructuring, renaming, or reorganizing code without changing behavior (signals: renames, moves, interface cleanup, no logic change)
+
+If the commit message conflicts with the diff, prioritize the diff. If ambiguous between two categories, choose the one most directly supported by the diff structure.
+
+Respond in valid JSON only — no markdown, no text outside the JSON object:
+{{"primary_activity": "<one of the four>", "sub_activity": "<specific sub-activity>", "reasoning": "<1-2 sentences citing specific evidence from the commit message or diff>"}}"""
 
 
 CHAIN_OF_THOUGHT_TEMPLATE = """\
 You are an expert software engineer specializing in ML systems and technical debt analysis.
 
-Analyze the following commit that introduced an ML-specific code smell.
+Your task: classify the **developer's primary goal** when making a commit that incidentally introduced an ML-specific code smell. Work through your reasoning explicitly before committing to a conclusion.
 
 **Smell Type:** {smell_type}{smell_name_suffix}
 **Commit Message:** {commit_message}
-{issue_context}{pr_context}
-**Code Diff:**
+{issue_context}{pr_context}**Code Diff:**
 ```
 {diff}
 ```
 
-Think step by step:
-1. What does the commit message indicate about the developer's intent?
-2. What changes does the diff show? Are new features added, bugs fixed, or existing code restructured?
-3. Is the smell incidental to the main change or central to it?
-4. Which activity category best fits?
+Reason through the following steps in order:
+1. **Intent signal**: What does the commit message explicitly state? Identify trigger words: "add"/"implement" → Feature Introduction; "fix"/"correct"/"resolve" → Bug Fixing; "improve"/"optimize"/"speed up" → Enhancement; "refactor"/"rename"/"reorganize" → Refactoring.
+2. **Diff evidence**: Is code being added (new files/classes/functions), corrected (targeted line changes to existing logic), optimized (algorithmic or config changes), or reorganized (renames/moves with equivalent behavior)?
+3. **Smell relationship**: Is the smell the direct target of this change, or was it introduced incidentally while pursuing the main goal? This distinction is critical.
+4. **Alternative check**: Identify the second-most-likely category and explain why the primary choice is stronger.
+5. **Final verdict**: Which category best fits, given all evidence?
 
 Activities:
-- Feature Introduction: Adding new ML functionality
-- Bug Fixing: Fixing a defect
-- Enhancement: Improving existing functionality
-- Refactoring: Restructuring without behavior change
+- **Feature Introduction** — adding new ML functionality, models, or pipeline components
+- **Bug Fixing** — correcting a defect, incorrect behavior, or failing test
+- **Enhancement** — improving performance, efficiency, or usability of existing functionality
+- **Refactoring** — restructuring, renaming, or reorganizing without behavior change
 
-Respond in valid JSON only (include your reasoning steps):
-{{"primary_activity": "<one of the four>", "sub_activity": "<specific sub-activity>", "reasoning": "<step-by-step reasoning leading to classification>"}}"""
+Respond in valid JSON only — embed your full step-by-step reasoning in the "reasoning" field:
+{{"primary_activity": "<one of the four>", "sub_activity": "<specific sub-activity>", "reasoning": "<numbered step-by-step reasoning from evidence to conclusion>"}}"""
 
 
 ROLE_PLAY_TEMPLATE = """\
-You are a senior ML engineering lead conducting a post-mortem code review. Your task is to determine what a developer was trying to accomplish when they inadvertently introduced an ML-specific code smell.
+You are a senior ML engineering lead with 10+ years of experience, conducting a post-mortem code review. A developer on your team introduced an ML-specific code smell during a recent commit. Your goal is to understand their primary intent — not to judge the smell, but to reconstruct the development context that produced it.
 
-**Context:**
+**Incident Details:**
 - Smell Introduced: {smell_type}{smell_name_suffix}
 - Developer's Commit Message: {commit_message}
-{issue_context}{pr_context}
-**Code Changes Made:**
+{issue_context}{pr_context}**Code Changes:**
 ```
 {diff}
 ```
 
-As a senior engineer, assess: what was this developer's primary goal when they made this change?
+From your experience: competent developers rarely introduce smells deliberately. Consider what goal, deadline pressure, or task context would lead a developer to make exactly these changes — and what the structure of the diff reveals about their focus at the time.
 
-Categories (choose one):
-- Feature Introduction: Developer was building/adding new ML functionality
-- Bug Fixing: Developer was fixing a broken or incorrect behavior
-- Enhancement: Developer was improving performance, usability, or maintainability
-- Refactoring: Developer was restructuring code architecture
+Classify their primary goal (choose one):
+- **Feature Introduction** — developer was building or adding new ML functionality, models, or pipeline components
+- **Bug Fixing** — developer was correcting a defect, incorrect behavior, or failing test
+- **Enhancement** — developer was improving performance, efficiency, or maintainability of existing code
+- **Refactoring** — developer was restructuring architecture or code organization without behavior change
 
-Respond in valid JSON only:
-{{"primary_activity": "<one of the four>", "sub_activity": "<e.g. model architecture update, data pipeline improvement>", "reasoning": "<your professional assessment>"}}"""
+Respond in valid JSON only — no markdown, no text outside the JSON object:
+{{"primary_activity": "<one of the four>", "sub_activity": "<specific sub-activity, e.g. 'model architecture update', 'training loop optimization'>", "reasoning": "<your professional assessment citing specific evidence from the commit message and diff>"}}"""
 
 
 PRESET_TEMPLATES = {
     "Zero-Shot": ZERO_SHOT_TEMPLATE,
-    "Few-Shot": FEW_SHOT_TEMPLATE,
+    "One-Shot": ONE_SHOT_TEMPLATE,
+    "Two-Shot": TWO_SHOT_TEMPLATE,
     "Chain-of-Thought": CHAIN_OF_THOUGHT_TEMPLATE,
     "Role-Play": ROLE_PLAY_TEMPLATE,
 }
@@ -229,7 +284,7 @@ async def run_ollama_query(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
-                max_tokens=600,
+                max_tokens=900,
             )
 
             raw = response.choices[0].message.content or ""
