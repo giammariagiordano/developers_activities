@@ -644,10 +644,11 @@ async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore, agg_sem:
         base_url = sess.get("ollama_base_url") or "http://localhost:11434"
         api_key = sess.get("llm_api_key") or "ollama"
         temperature = sess.get("temperature", 0.0)
+        n_runs = int(sess.get("n_runs") or 3)
 
         for p in patterns:
             await _classify_smell_pattern(
-                sc, p, sess, classifier_models, aggregator_model, base_url, api_key, temperature, sem, agg_sem
+                sc, p, sess, classifier_models, aggregator_model, base_url, api_key, temperature, n_runs, sem, agg_sem
             )
 
         # Mark completed if at least one result stored
@@ -695,8 +696,8 @@ async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore, agg_sem:
 async def _classify_smell_pattern(
     sc: dict, pattern: dict, sess: dict,
     classifier_models: list[str], aggregator_model: str,
-    base_url: str, api_key: str, temperature: float, sem: asyncio.Semaphore,
-    agg_sem: asyncio.Semaphore,
+    base_url: str, api_key: str, temperature: float, n_runs: int,
+    sem: asyncio.Semaphore, agg_sem: asyncio.Semaphore,
 ):
     sc_id = sc["id"]
     pattern_id = pattern["id"]
@@ -712,27 +713,64 @@ async def _classify_smell_pattern(
 
     prompt = build_prompt(pattern["template"], sc)
 
-    # Run 3 classifiers in parallel (each acquires semaphore slot independently)
-    async def _call_classifier(model_name: str, run_idx: int) -> dict:
-        async with sem:
-            result = await run_ollama_query(
-                prompt=prompt,
-                model=model_name,
-                temperature=temperature,
-                base_url=base_url,
-                api_key=api_key,
-            )
-            result["model_name"] = model_name
+    # Self-consistency: run each classifier model n_runs times, take majority vote per model
+    async def _call_classifier_once(model_name: str) -> dict:
+        import logging as _log
+        try:
+            async with sem:
+                result = await run_ollama_query(
+                    prompt=prompt,
+                    model=model_name,
+                    temperature=temperature,
+                    base_url=base_url,
+                    api_key=api_key,
+                )
+                result["model_name"] = model_name
+                return result
+        except Exception as _e:
+            _log.getLogger(__name__).error(f"_call_once {model_name}: {type(_e).__name__}: {_e}")
+            raise
+
+    async def _call_classifier_consensus(model_name: str, run_idx: int) -> dict:
+        if n_runs <= 1:
+            result = await _call_classifier_once(model_name)
             result["run_number"] = run_idx
             return result
+        # Run n_runs times sequentially to avoid burst rate limiting
+        runs = []
+        for _ in range(n_runs):
+            try:
+                runs.append(await _call_classifier_once(model_name))
+            except Exception as e:
+                runs.append(e)
+        valid_runs = [r for r in runs if isinstance(r, dict) and r.get("primary_activity")]
+        if not valid_runs:
+            raise RuntimeError(f"All {n_runs} runs failed for model {model_name}")
+        # Majority vote on primary_activity
+        vote_counts = Counter(r["primary_activity"] for r in valid_runs)
+        majority_label = vote_counts.most_common(1)[0][0]
+        # Use reasoning from first run that matches the majority label
+        majority_runs = [r for r in valid_runs if r["primary_activity"] == majority_label]
+        consensus = majority_runs[0]
+        consensus["run_number"] = run_idx
+        consensus["vote_counts"] = dict(vote_counts)
+        # Collect all sub_activity candidates from runs that agreed on primary
+        consensus["sub_activity_candidates"] = list(dict.fromkeys(
+            r["sub_activity"] for r in majority_runs if r.get("sub_activity")
+        ))
+        return consensus
 
     classifier_results = await asyncio.gather(*[
-        _call_classifier(model, idx) for idx, model in enumerate(classifier_models)
+        _call_classifier_consensus(model, idx) for idx, model in enumerate(classifier_models)
     ], return_exceptions=True)
 
     # Filter out exceptions, keep successes
     valid_results = [r for r in classifier_results if isinstance(r, dict)]
     if not valid_results:
+        for i, r in enumerate(classifier_results):
+            if isinstance(r, Exception):
+                import logging
+                logging.getLogger(__name__).error(f"Classifier {classifier_models[i] if i < len(classifier_models) else i} failed: {type(r).__name__}: {r}")
         raise RuntimeError("All classifier models failed")
 
     # Store individual classifier results

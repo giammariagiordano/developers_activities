@@ -193,16 +193,20 @@ PRESET_TEMPLATES = {
 # ─── Prompt Builder ───────────────────────────────────────────────────────────
 
 
+def _escape_braces(s: str) -> str:
+    return s.replace("{", "{{").replace("}", "}}")
+
+
 def build_prompt(template: str, task_data: dict) -> str:
     smell_name_suffix = f" ({task_data['smell_type']})" if task_data.get("function_name") else ""
-    issue_ctx = f"**Issue Context:** {task_data['issue_summary']}\n" if task_data.get("issue_summary") else ""
-    pr_ctx = f"**PR Context:** {task_data['pr_summary']}\n" if task_data.get("pr_summary") else ""
+    issue_ctx = f"**Issue Context:** {_escape_braces(task_data['issue_summary'])}\n" if task_data.get("issue_summary") else ""
+    pr_ctx = f"**PR Context:** {_escape_braces(task_data['pr_summary'])}\n" if task_data.get("pr_summary") else ""
 
     return template.format(
-        diff=task_data.get("diff_content") or "[No diff available]",
-        commit_message=task_data.get("commit_message") or "[No commit message]",
-        smell_type=task_data.get("smell_type", "Unknown"),
-        smell_name_suffix=smell_name_suffix,
+        diff=_escape_braces(task_data.get("diff_content") or "[No diff available]"),
+        commit_message=_escape_braces(task_data.get("commit_message") or "[No commit message]"),
+        smell_type=_escape_braces(task_data.get("smell_type", "Unknown")),
+        smell_name_suffix=_escape_braces(smell_name_suffix),
         issue_context=issue_ctx,
         pr_context=pr_ctx,
     )
@@ -215,17 +219,23 @@ def build_aggregator_prompt(smell_data: dict, responses: list[dict]) -> str:
 
     model_blocks = ""
     for i, r in enumerate(responses, 1):
+        candidates = r.get("sub_activity_candidates") or []
+        if len(candidates) > 1:
+            sub_line = f"{candidates[0]} (candidates: {', '.join(candidates)})"
+        else:
+            sub_line = r.get('sub_activity') or '—'
         model_blocks += f"""
 Model {i} ({r['model_name']}):
   primary_activity: {r.get('primary_activity') or 'Unknown'}
-  sub_activity: {r.get('sub_activity') or '—'}
+  sub_activity: {sub_line}
   reasoning: {r.get('reasoning') or '—'}
 """
 
+    n_models = len(responses)
     return f"""\
 You are an expert software engineering researcher acting as a meta-classifier.
 
-Three independent AI models have analyzed the following ML code smell commit and produced their classifications. Your task is to synthesize their analyses into a single, well-reasoned final classification.
+{n_models} independent AI models have analyzed the following ML code smell commit and produced their classifications. Your task is to synthesize their analyses into a single, well-reasoned final classification.
 
 **Smell Type:** {smell_type}
 **Commit Message:** {commit_msg}
@@ -237,16 +247,20 @@ Three independent AI models have analyzed the following ML code smell commit and
 **Model Classifications:**
 {model_blocks}
 
-Based on all three analyses, provide your final authoritative classification. Weight the reasoning quality, not just the labels. If models disagree, explain why you chose one over the others.
+Synthesize these classifications into one authoritative verdict. Follow this procedure:
+1. **Evaluate reasoning quality**: prefer reasoning that cites specific evidence from the commit message or diff over reasoning that is vague or generic.
+2. **Resolve disagreements by evidence**: if models disagree, identify which reasoning is best supported by the diff structure — not which label appears most often.
+3. **Apply tiebreaker**: majority label wins only when reasoning quality is equal across disagreeing models.
+4. **Harmonize sub_activity**: review all sub_activity values and candidates across models. Merge synonyms and overlapping descriptions into a single canonical label (2-4 words, lowercase, singular). Example: "gradient fix", "fixing gradient bug", "gradient management fix" → "gradient management fix".
 
 Choose exactly one primary activity:
-- Feature Introduction: Adding new ML functionality or components
-- Bug Fixing: Fixing a defect or incorrect behavior
-- Enhancement: Improving or optimizing existing functionality
-- Refactoring: Restructuring code without changing external behavior
+- **Feature Introduction** — developer was adding new ML functionality, models, or pipeline components (signals: new files, new classes, new integrations)
+- **Bug Fixing** — developer was correcting a defect, incorrect behavior, or failing test (signals: targeted line corrections, error handling, test fixes)
+- **Enhancement** — developer was improving performance, efficiency, or usability of existing functionality (signals: algorithmic changes, vectorization, config tuning)
+- **Refactoring** — developer was restructuring, renaming, or reorganizing code without changing behavior (signals: renames, moves, interface cleanup, no logic change)
 
-Respond in valid JSON only:
-{{"primary_activity": "<one of the four>", "sub_activity": "<specific sub-activity>", "reasoning": "<your synthesis of the three analyses>"}}"""
+Respond in valid JSON only — no markdown, no text outside the JSON object:
+{{"primary_activity": "<one of the four>", "sub_activity": "<single canonical label, 2-4 words, lowercase, singular>", "reasoning": "<which model(s) you followed, why their reasoning was strongest, and what evidence supports the final verdict>"}}"""
 
 
 # ─── Ollama / OpenAI-compatible Client ────────────────────────────────────────

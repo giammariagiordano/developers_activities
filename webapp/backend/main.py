@@ -47,11 +47,12 @@ app.add_middleware(
 
 class SessionCreate(BaseModel):
     name: str
-    classifier_models: list[str] = ["llama-3.1-8b-instant", "gemma2-9b-it", "mixtral-8x7b-32768"]
+    classifier_models: list[str] = ["qwen/qwen3-32b", "openai/gpt-oss-20b", "groq/compound-mini"]
     aggregator_model: str = "llama-3.3-70b-versatile"
     ollama_base_url: str = "https://api.groq.com/openai"
     llm_api_key: Optional[str] = None
     temperature: float = 0.0
+    n_runs: int = 3
     max_parallel_llm: int = 3
     github_token: Optional[str] = None
     branch: str = "main"
@@ -65,6 +66,7 @@ class SessionUpdate(BaseModel):
     ollama_base_url: Optional[str] = None
     llm_api_key: Optional[str] = None
     temperature: Optional[float] = None
+    n_runs: Optional[int] = None
     max_parallel_llm: Optional[int] = None
     github_token: Optional[str] = None
     branch: Optional[str] = None
@@ -102,25 +104,26 @@ async def create_session(body: SessionCreate):
         cur = await db.execute(
             """INSERT INTO sessions
                (name, classifier_models, aggregator_model, ollama_base_url,
-                llm_api_key, temperature, max_parallel_llm, github_token, branch, max_commits,
+                llm_api_key, temperature, n_runs, max_parallel_llm, github_token, branch, max_commits,
                 created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (body.name,
              _json.dumps(body.classifier_models),
              body.aggregator_model,
              body.ollama_base_url,
              body.llm_api_key,
-             body.temperature, body.max_parallel_llm,
+             body.temperature, body.n_runs, body.max_parallel_llm,
              body.github_token, body.branch, body.max_commits,
              now_iso(), now_iso()),
         )
         session_id = cur.lastrowid
 
-        # Create default zero-shot pattern
-        await db.execute(
-            "INSERT INTO prompt_patterns (session_id, position, name, template, enabled) VALUES (?,?,?,?,?)",
-            (session_id, 0, "Zero-Shot", PRESET_TEMPLATES["Zero-Shot"], 1),
-        )
+        # Create all 5 preset patterns by default
+        for pos, (name, template) in enumerate(PRESET_TEMPLATES.items()):
+            await db.execute(
+                "INSERT INTO prompt_patterns (session_id, position, name, template, enabled) VALUES (?,?,?,?,?)",
+                (session_id, pos, name, template, 1),
+            )
         await db.commit()
 
         row = await (await db.execute("SELECT * FROM sessions WHERE id=?", (session_id,))).fetchone()
@@ -353,7 +356,7 @@ async def get_preset_templates():
 
 @app.post("/api/sessions/{sid}/smells/upload", status_code=201)
 async def upload_smells(sid: int, file: UploadFile = File(...)):
-    """Upload pre-computed smell instances as CSV (skips Phase 1 scan)."""
+    """Upload pre-computed smell instances as CSV (skips Phase 1), or a repo list CSV."""
     content = await file.read()
     text = content.decode("utf-8-sig")
 
@@ -365,6 +368,35 @@ async def upload_smells(sid: int, file: UploadFile = File(...)):
 
     if not rows:
         raise HTTPException(400, "No data found")
+
+    # Detect repo-list CSV: has 'repo' column but no 'commit_hash'
+    sample = rows[0]
+    is_repo_list = ("repo" in sample or "full_repo_name" in sample) and not any(
+        k in sample for k in ("commit_hash", "commit", "sha")
+    )
+    if is_repo_list:
+        now = now_iso()
+        added = 0
+        async with get_db() as db:
+            for r in rows:
+                repo_str = r.get("repo") or r.get("full_repo_name") or ""
+                repo_str = repo_str.strip()
+                if not repo_str or "/" not in repo_str:
+                    continue
+                owner, repo_name = repo_str.split("/", 1)
+                existing = await (await db.execute(
+                    "SELECT id FROM repositories WHERE session_id=? AND owner=? AND name=?",
+                    (sid, owner, repo_name),
+                )).fetchone()
+                if not existing:
+                    await db.execute(
+                        "INSERT INTO repositories (session_id, owner, name, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                        (sid, owner, repo_name, "pending", now, now),
+                    )
+                    added += 1
+            await db.commit()
+        return {"mode": "repo_list", "added": added}
+
 
     now = now_iso()
     inserted = 0
@@ -968,10 +1000,10 @@ async def _fetch_github_repo(client: httpx.AsyncClient, owner: str, name: str, t
 @app.get("/api/sessions/{sid}/dataset-stats")
 async def session_dataset_stats(sid: int):
     async with get_db() as db:
-        session_row = await db.execute_fetchone("SELECT github_token FROM sessions WHERE id = ?", (sid,))
-        repo_rows = await db.execute_fetchall(
+        session_row = await (await db.execute("SELECT github_token FROM sessions WHERE id = ?", (sid,))).fetchone()
+        repo_rows = await (await db.execute(
             "SELECT owner, name FROM repositories WHERE session_id = ?", (sid,)
-        )
+        )).fetchall()
     if not repo_rows:
         return {"total_repos": 0, "stars": {}, "forks": {}, "open_issues": {}, "size_kb": {}, "lines_of_code": {}}
 

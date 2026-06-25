@@ -242,11 +242,11 @@ async function renderSessions() {
           </div>
           <div class="grid grid-cols-3 gap-2">
             <div><label class="text-sm font-medium">Classifier 1</label>
-              <input id="new-cls-0" value="llama-3.1-8b-instant" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+              <input id="new-cls-0" value="qwen/qwen3-32b" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
             <div><label class="text-sm font-medium">Classifier 2</label>
-              <input id="new-cls-1" value="gemma2-9b-it" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+              <input id="new-cls-1" value="openai/gpt-oss-20b" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
             <div><label class="text-sm font-medium">Classifier 3</label>
-              <input id="new-cls-2" value="mixtral-8x7b-32768" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+              <input id="new-cls-2" value="groq/compound-mini" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
           </div>
           <div><label class="text-sm font-medium">Aggregator Model</label>
             <input id="new-agg" value="llama-3.3-70b-versatile" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
@@ -312,6 +312,7 @@ async function createSession() {
     aggregator_model: el('new-agg').value.trim() || 'llama-3.3-70b-versatile',
     github_token: el('new-gh').value.trim() || null,
     temperature: parseFloat(el('new-temp').value),
+    n_runs: 3,
   });
   location.hash = `#/session/${s.id}`;
 }
@@ -423,7 +424,7 @@ function renderTab(tab) {
 function renderConfig() {
   const s = state.session;
   const classifiers = (() => {
-    try { return JSON.parse(s.classifier_models || '[]'); } catch { return ["gemma3:12b","qwen2.5:7b","mistral:7b"]; }
+    try { return JSON.parse(s.classifier_models || '[]'); } catch { return ["qwen/qwen3-32b","openai/gpt-oss-20b","groq/compound-mini"]; }
   })();
   while (classifiers.length < 3) classifiers.push('');
 
@@ -478,7 +479,7 @@ function renderConfig() {
         <!-- Aggregator -->
         <div>
           <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Aggregator Model <span class="text-gray-400 font-normal normal-case">(synthesizes the 3 responses)</span></div>
-          <input id="cfg-agg" value="${s.aggregator_model || 'llama3.1:8b'}"
+          <input id="cfg-agg" value="${s.aggregator_model || 'llama-3.3-70b-versatile'}"
             class="w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="e.g. llama3.1:8b" />
         </div>
 
@@ -487,6 +488,11 @@ function renderConfig() {
           <div>
             <label class="text-sm font-medium text-gray-700">Temperature</label>
             <input id="cfg-temp" type="number" min="0" max="2" step="0.1" value="${s.temperature}"
+              class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" />
+          </div>
+          <div>
+            <label class="text-sm font-medium text-gray-700">Runs per model <span class="text-gray-400">(self-consistency)</span></label>
+            <input id="cfg-nruns" type="number" min="1" max="10" value="${s.n_runs || 3}"
               class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" />
           </div>
           <div>
@@ -547,6 +553,7 @@ async function saveConfig() {
       ollama_base_url: el('cfg-ollama-url').value.trim(),
       llm_api_key: el('cfg-llm-key').value.trim() || null,
       temperature: parseFloat(el('cfg-temp').value),
+      n_runs: parseInt(el('cfg-nruns').value) || 3,
       max_parallel_llm: parseInt(el('cfg-parallel').value),
       branch: el('cfg-branch').value.trim(),
       max_commits: el('cfg-maxcommits').value ? parseInt(el('cfg-maxcommits').value) : null,
@@ -786,8 +793,11 @@ function renderData() {
 
       <div class="grid grid-cols-2 gap-4 mb-6">
         <div class="bg-white rounded-xl border shadow-sm p-4">
-          <div class="text-xs text-gray-500 font-medium uppercase tracking-wide mb-2">Upload CSV/JSON (skip Phase 1)</div>
-          <p class="text-xs text-gray-400 mb-3">Pre-computed CodeSmile output. Required columns: <code class="bg-gray-100 px-1 rounded">repo</code> (owner/name), <code class="bg-gray-100 px-1 rounded">commit_hash</code>, <code class="bg-gray-100 px-1 rounded">file_path</code>, <code class="bg-gray-100 px-1 rounded">smell_type</code></p>
+          <div class="text-xs text-gray-500 font-medium uppercase tracking-wide mb-2">Upload CSV/JSON</div>
+          <p class="text-xs text-gray-400 mb-3">
+            <b>Repo list:</b> single <code class="bg-gray-100 px-1 rounded">repo</code> column (owner/name) → adds repos, then run Phase 1.<br/>
+            <b>Smell data:</b> pre-computed CodeSmile output with <code class="bg-gray-100 px-1 rounded">repo</code>, <code class="bg-gray-100 px-1 rounded">commit_hash</code>, <code class="bg-gray-100 px-1 rounded">file_path</code>, <code class="bg-gray-100 px-1 rounded">smell_type</code> → skips Phase 1.
+          </p>
           <input type="file" id="upload-file" accept=".csv,.json" class="text-sm text-gray-500 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border file:text-sm file:font-medium file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100" />
           <button onclick="uploadSmells()" class="mt-3 bg-blue-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-blue-700 block">Upload</button>
         </div>
@@ -898,8 +908,14 @@ async function uploadSmells() {
   const f = el('upload-file')?.files[0];
   if (!f) { alert('Select a file first'); return; }
   const result = await API.upload(`/api/sessions/${state.session.id}/smells/upload`, f);
-  addLog(`Uploaded ${result.inserted} smell instances (total: ${result.total})`, 'success');
-  loadSmells();
+  if (result.mode === 'repo_list') {
+    addLog(`Repo list imported: ${result.added} repo(s) added. Run Phase 1 to scan them.`, 'success');
+    state.session = await API.get(`/api/sessions/${state.session.id}`);
+    renderTab('repos');
+  } else {
+    addLog(`Uploaded ${result.inserted} smell instances (total: ${result.total})`, 'success');
+    loadSmells();
+  }
 }
 
 async function resetFailed() {

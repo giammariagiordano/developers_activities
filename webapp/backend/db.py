@@ -140,6 +140,7 @@ async def init_db():
             "ALTER TABLE sessions ADD COLUMN ollama_base_url TEXT NOT NULL DEFAULT 'http://localhost:11434'",
             "ALTER TABLE llm_results ADD COLUMN model_name TEXT",
             "ALTER TABLE sessions ADD COLUMN llm_api_key TEXT",
+            "ALTER TABLE sessions ADD COLUMN n_runs INTEGER NOT NULL DEFAULT 3",
         ]:
             try:
                 await db.execute(migration)
