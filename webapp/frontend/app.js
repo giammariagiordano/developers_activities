@@ -235,21 +235,34 @@ async function renderSessions() {
           <div><label class="text-sm font-medium">Session Name *</label>
             <input id="new-name" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" placeholder="e.g. Experiment 1 - Few-shot vs Zero-shot" /></div>
           <div class="grid grid-cols-2 gap-3">
-            <div><label class="text-sm font-medium">LLM Base URL</label>
-              <input id="new-ollama-url" value="https://api.groq.com/openai" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
-            <div><label class="text-sm font-medium">API Key <span class="text-gray-400">(Groq/OpenAI, blank = Ollama)</span></label>
-              <input id="new-llm-key" type="password" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="gsk_..." /></div>
+            <div><label class="text-sm font-medium">Ollama Base URL</label>
+              <div class="flex gap-2 mt-1">
+                <input id="new-ollama-url" value="http://localhost:11434" class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" />
+                <button onclick="loadModelsForCreate()" class="border px-3 py-2 rounded-lg text-sm hover:bg-gray-50 whitespace-nowrap">↻ Load</button>
+              </div>
+            </div>
+            <div><label class="text-sm font-medium">API Key <span class="text-gray-400">(blank = local Ollama)</span></label>
+              <input id="new-llm-key" type="password" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="optional" /></div>
           </div>
+          <div id="new-models-hint" class="text-xs"></div>
           <div class="grid grid-cols-3 gap-2">
             <div><label class="text-sm font-medium">Classifier 1</label>
-              <input id="new-cls-0" value="qwen/qwen3-32b" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+              <select id="new-cls-0" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono bg-white">
+                <option value="">— click ↻ Load —</option>
+              </select></div>
             <div><label class="text-sm font-medium">Classifier 2</label>
-              <input id="new-cls-1" value="openai/gpt-oss-20b" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+              <select id="new-cls-1" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono bg-white">
+                <option value="">— click ↻ Load —</option>
+              </select></div>
             <div><label class="text-sm font-medium">Classifier 3</label>
-              <input id="new-cls-2" value="groq/compound-mini" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+              <select id="new-cls-2" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono bg-white">
+                <option value="">— click ↻ Load —</option>
+              </select></div>
           </div>
           <div><label class="text-sm font-medium">Aggregator Model</label>
-            <input id="new-agg" value="llama-3.3-70b-versatile" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" /></div>
+            <select id="new-agg" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono bg-white">
+              <option value="">— click ↻ Load —</option>
+            </select></div>
           <div class="grid grid-cols-2 gap-3">
             <div><label class="text-sm font-medium">GitHub Token</label>
               <input id="new-gh" type="password" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="ghp_..." /></div>
@@ -306,10 +319,10 @@ async function createSession() {
   if (!name) { alert('Session name required'); return; }
   const s = await API.post('/api/sessions', {
     name,
-    ollama_base_url: el('new-ollama-url').value.trim() || 'https://api.groq.com/openai',
+    ollama_base_url: el('new-ollama-url').value.trim() || 'http://localhost:11434',
     llm_api_key: el('new-llm-key').value.trim() || null,
     classifier_models: [0,1,2].map(i => el(`new-cls-${i}`)?.value.trim()).filter(Boolean),
-    aggregator_model: el('new-agg').value.trim() || 'llama-3.3-70b-versatile',
+    aggregator_model: el('new-agg').value.trim() || 'llama3.1:8b',
     github_token: el('new-gh').value.trim() || null,
     temperature: parseFloat(el('new-temp').value),
     n_runs: 3,
@@ -334,6 +347,7 @@ async function loadSession(id) {
     state.patterns = await API.get(`/api/sessions/${id}/patterns`);
     state.tab = 'config';
     renderSessionPage();
+    loadModelsForConfig();
     startSSE(id);
   } catch(e) {
     el('app').innerHTML = `<div class="max-w-6xl mx-auto px-6 py-16 text-center">
@@ -423,10 +437,6 @@ function renderTab(tab) {
 
 function renderConfig() {
   const s = state.session;
-  const classifiers = (() => {
-    try { return JSON.parse(s.classifier_models || '[]'); } catch { return ["qwen/qwen3-32b","openai/gpt-oss-20b","groq/compound-mini"]; }
-  })();
-  while (classifiers.length < 3) classifiers.push('');
 
   return `
     <div class="max-w-2xl">
@@ -444,22 +454,22 @@ function renderConfig() {
           <div class="space-y-3">
             <div class="grid grid-cols-2 gap-3">
               <div>
-                <label class="text-sm font-medium text-gray-700">Base URL</label>
+                <label class="text-sm font-medium text-gray-700">Ollama Base URL</label>
                 <div class="flex gap-2 mt-1">
-                  <input id="cfg-ollama-url" value="${s.ollama_base_url || 'https://api.groq.com/openai'}"
+                  <input id="cfg-ollama-url" value="${s.ollama_base_url || 'http://localhost:11434'}"
                     class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" />
-                  <button onclick="loadOllamaModels()" class="border px-3 py-2 rounded-lg text-sm hover:bg-gray-50 whitespace-nowrap">
-                    ↻ List
+                  <button onclick="loadModelsForConfig()" class="border px-3 py-2 rounded-lg text-sm hover:bg-gray-50 whitespace-nowrap">
+                    ↻ Refresh
                   </button>
                 </div>
               </div>
               <div>
-                <label class="text-sm font-medium text-gray-700">API Key <span class="text-gray-400">(blank = Ollama)</span></label>
+                <label class="text-sm font-medium text-gray-700">API Key <span class="text-gray-400">(blank = local Ollama)</span></label>
                 <input id="cfg-llm-key" type="password" value="${s.llm_api_key || ''}"
-                  class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="gsk_... / sk-..." />
+                  class="mt-1 w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="optional" />
               </div>
             </div>
-            <div id="ollama-models-hint" class="text-xs text-gray-400"></div>
+            <div id="cfg-models-hint" class="text-xs"></div>
           </div>
         </div>
 
@@ -470,8 +480,9 @@ function renderConfig() {
             ${[0,1,2].map(i => `
               <div class="flex items-center gap-2">
                 <span class="text-xs text-gray-400 w-16">Model ${i+1}</span>
-                <input id="cfg-cls-${i}" value="${classifiers[i] || ''}"
-                  class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono" placeholder="e.g. gemma3:12b" />
+                <select id="cfg-cls-${i}" class="flex-1 border rounded-lg px-3 py-2 text-sm font-mono bg-white">
+                  <option value="">Loading…</option>
+                </select>
               </div>`).join('')}
           </div>
         </div>
@@ -479,8 +490,9 @@ function renderConfig() {
         <!-- Aggregator -->
         <div>
           <div class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Aggregator Model <span class="text-gray-400 font-normal normal-case">(synthesizes the 3 responses)</span></div>
-          <input id="cfg-agg" value="${s.aggregator_model || 'llama-3.3-70b-versatile'}"
-            class="w-full border rounded-lg px-3 py-2 text-sm font-mono" placeholder="e.g. llama3.1:8b" />
+          <select id="cfg-agg" class="w-full border rounded-lg px-3 py-2 text-sm font-mono bg-white">
+            <option value="">Loading…</option>
+          </select>
         </div>
 
         <!-- Other settings -->
@@ -526,19 +538,86 @@ function renderConfig() {
     </div>`;
 }
 
-async function loadOllamaModels() {
-  const baseUrl = el('cfg-ollama-url')?.value || 'http://localhost:11434';
-  const hint = el('ollama-models-hint');
+function populateModelSelects(prefix, models, savedValues) {
+  const SELECTS = [
+    { id: `${prefix}-cls-0`, key: 'cls0' },
+    { id: `${prefix}-cls-1`, key: 'cls1' },
+    { id: `${prefix}-cls-2`, key: 'cls2' },
+    { id: `${prefix}-agg`,   key: 'agg'  },
+  ];
+  const missing = [];
+  SELECTS.forEach(({ id, key }) => {
+    const sel = el(id);
+    if (!sel) return;
+    const current = savedValues[key] || '';
+    sel.innerHTML = '';
+    if (models.length === 0) {
+      sel.innerHTML = '<option value="">— Ollama not reachable —</option>';
+      return;
+    }
+    if (current && !models.includes(current)) {
+      const opt = document.createElement('option');
+      opt.value = current;
+      opt.textContent = `⚠ ${current} (not installed)`;
+      opt.selected = true;
+      sel.appendChild(opt);
+      missing.push(current);
+    }
+    models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      if (m === current) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  });
+  const hint = el(`${prefix}-models-hint`);
+  if (!hint) return;
+  if (models.length === 0) {
+    hint.innerHTML = `<span class="text-red-500">Ollama not reachable — run: <code class="bg-gray-100 px-1 rounded">ollama serve</code></span>`;
+  } else if (missing.length > 0) {
+    hint.innerHTML = `<span class="text-amber-600">Not installed — run: ${missing.map(m => `<code class="bg-gray-100 px-1 rounded">ollama pull ${escHtml(m)}</code>`).join(' ')}</span>`;
+  } else {
+    hint.innerHTML = `<span class="text-green-600">${models.length} model(s) available</span>`;
+  }
+}
+
+async function loadModelsForConfig() {
+  const urlEl = el('cfg-ollama-url');
+  if (!urlEl) return;
+  const baseUrl = urlEl.value.trim() || 'http://localhost:11434';
+  const hint = el('cfg-models-hint');
+  if (hint) hint.textContent = 'Loading models…';
+  const s = state.session || {};
+  let cls = [];
+  try { cls = JSON.parse(s.classifier_models || '[]'); } catch {}
+  while (cls.length < 3) cls.push('');
+  try {
+    const data = await API.get(`/api/ollama/models?base_url=${encodeURIComponent(baseUrl)}`);
+    populateModelSelects('cfg', data.models || [], {
+      cls0: cls[0] || 'gemma3:12b',
+      cls1: cls[1] || 'qwen2.5:7b',
+      cls2: cls[2] || 'mistral:7b',
+      agg:  s.aggregator_model || 'llama3.1:8b',
+    });
+  } catch(e) {
+    if (hint) hint.innerHTML = `<span class="text-red-500">Error: ${escHtml(e.message)}</span>`;
+  }
+}
+
+async function loadModelsForCreate() {
+  const urlEl = el('new-ollama-url');
+  if (!urlEl) return;
+  const baseUrl = urlEl.value.trim() || 'http://localhost:11434';
+  const hint = el('new-models-hint');
   if (hint) hint.textContent = 'Loading…';
   try {
     const data = await API.get(`/api/ollama/models?base_url=${encodeURIComponent(baseUrl)}`);
-    if (data.models?.length) {
-      if (hint) hint.innerHTML = `Available: ${data.models.map(m => `<code class="bg-gray-100 px-1 rounded">${m}</code>`).join(' ')}`;
-    } else {
-      if (hint) hint.textContent = data.error || 'No models found';
-    }
+    populateModelSelects('new', data.models || [], {
+      cls0: 'gemma3:12b', cls1: 'qwen2.5:7b', cls2: 'mistral:7b', agg: 'llama3.1:8b',
+    });
   } catch(e) {
-    if (hint) hint.textContent = 'Error: ' + e.message;
+    if (hint) hint.innerHTML = `<span class="text-red-500">Error: ${escHtml(e.message)}</span>`;
   }
 }
 
@@ -1703,6 +1782,8 @@ window.switchTab = async function(tab) {
     await refreshResults();
   } else if (tab === 'dataset') {
     await loadDatasetStats();
+  } else if (tab === 'config') {
+    await loadModelsForConfig();
   }
 };
 
@@ -1736,7 +1817,8 @@ window.backfillDates = backfillDates;
 window.importReposCSV = importReposCSV;
 window.importLocalPath = importLocalPath;
 window.clearAllRepos = clearAllRepos;
-window.loadOllamaModels = loadOllamaModels;
+window.loadModelsForConfig = loadModelsForConfig;
+window.loadModelsForCreate = loadModelsForCreate;
 window.loadDatasetStats = loadDatasetStats;
 window.refreshResults = refreshResults;
 window.route = route;

@@ -538,6 +538,7 @@ async def _run_phase2(session_id: int):
 
         sem = asyncio.Semaphore(sess.get("max_parallel_llm", 20))
         agg_sem = asyncio.Semaphore(max(2, (sess.get("max_parallel_llm") or 6) // 3))
+        commit_sem = asyncio.Semaphore(sess.get("max_parallel_llm") or 1)
 
         while True:
             # Pause check
@@ -588,7 +589,7 @@ async def _run_phase2(session_id: int):
                 await db.commit()
 
             await asyncio.gather(*[
-                _classify_smell(sc, sess, sem, agg_sem) for sc in batch
+                _classify_smell(sc, sess, sem, agg_sem, commit_sem) for sc in batch
             ], return_exceptions=True)
 
     except Exception as e:
@@ -601,7 +602,15 @@ async def _run_phase2(session_id: int):
         await _broadcast(session_id, "error", {"message": str(e)})
 
 
-async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore, agg_sem: asyncio.Semaphore):
+async def _classify_smell(sc: dict, sess: dict, sem: asyncio.Semaphore, agg_sem: asyncio.Semaphore, commit_sem: asyncio.Semaphore):
+    sc_id = sc["id"]
+    session_id = sc["session_id"]
+
+    async with commit_sem:
+        await _classify_smell_inner(sc, sess, sem, agg_sem)
+
+
+async def _classify_smell_inner(sc: dict, sess: dict, sem: asyncio.Semaphore, agg_sem: asyncio.Semaphore):
     sc_id = sc["id"]
     session_id = sc["session_id"]
 
@@ -760,9 +769,15 @@ async def _classify_smell_pattern(
         ))
         return consensus
 
-    classifier_results = await asyncio.gather(*[
-        _call_classifier_consensus(model, idx) for idx, model in enumerate(classifier_models)
-    ], return_exceptions=True)
+    # Run classifier models one at a time (not gathered) so each model's calls
+    # stay grouped together — avoids Ollama swapping models on every request
+    # when only one model can stay resident in memory at once.
+    classifier_results = []
+    for idx, model in enumerate(classifier_models):
+        try:
+            classifier_results.append(await _call_classifier_consensus(model, idx))
+        except Exception as e:
+            classifier_results.append(e)
 
     # Filter out exceptions, keep successes
     valid_results = [r for r in classifier_results if isinstance(r, dict)]

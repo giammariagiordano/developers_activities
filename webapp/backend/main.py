@@ -47,9 +47,9 @@ app.add_middleware(
 
 class SessionCreate(BaseModel):
     name: str
-    classifier_models: list[str] = ["qwen/qwen3-32b", "openai/gpt-oss-20b", "groq/compound-mini"]
-    aggregator_model: str = "llama-3.3-70b-versatile"
-    ollama_base_url: str = "https://api.groq.com/openai"
+    classifier_models: list[str] = ["gemma3:12b", "qwen2.5:7b", "mistral:7b"]
+    aggregator_model: str = "llama3.1:8b"
+    ollama_base_url: str = "http://localhost:11434"
     llm_api_key: Optional[str] = None
     temperature: float = 0.0
     n_runs: int = 3
